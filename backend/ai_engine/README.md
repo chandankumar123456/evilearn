@@ -39,6 +39,7 @@ backend/ai_engine/
 ├── __init__.py      # Exports: ValidationPipeline, build_validation_graph
 ├── pipeline.py      # ALL agent logic — pure functions + StateGraph + graph builder
 ├── thinking_engine.py  # Thinking Simulation Engine — graph-based cognitive reasoning (LangGraph)
+├── cognitive_load_optimizer.py  # Cognitive Load Optimizer — real-time reasoning flow regulator (LangGraph, cyclic)
 ├── stress_test_agent/  # Knowledge Stress-Test Engine
 │   ├── stress_test_agent.py       # Main orchestrator
 │   ├── concept_extractor.py       # Extract key concepts from claims
@@ -54,7 +55,7 @@ backend/ai_engine/
 └── README.md        # This file
 ```
 
-There is **no `agents/` directory**. Core pipeline agent logic is defined inline in `pipeline.py` as top-level pure functions. The stress test engine is modularized in the `stress_test_agent/` directory. The thinking simulation engine is a separate LangGraph StateGraph in `thinking_engine.py`.
+There is **no `agents/` directory**. Core pipeline agent logic is defined inline in `pipeline.py` as top-level pure functions. The stress test engine is modularized in the `stress_test_agent/` directory. The thinking simulation engine is a separate LangGraph StateGraph in `thinking_engine.py`. The cognitive load optimizer is a cyclic LangGraph StateGraph in `cognitive_load_optimizer.py`.
 
 ## Pipeline State
 
@@ -678,3 +679,121 @@ decisions[] → decision_point, alternatives_considered, chosen_path_reason
 - **Student reasoning extraction is approximate.** Rule-based fallback uses keyword matching when LLM is unavailable.
 - **No caching.** Each simulation is independent.
 - **No feedback loop.** The system does not learn from past simulations.
+
+---
+
+## Cognitive Load Optimizer (`cognitive_load_optimizer.py`)
+
+> The Cognitive Load Optimizer is a **real-time reasoning flow regulator** — NOT a tutor or content generator. It controls HOW explanations are presented, not WHAT they contain. It sits between explanation output and the user.
+
+### Feature Overview
+
+The optimizer analyzes explanation structure (step density, concept gaps, memory demand), tracks a dynamic user cognitive state across interactions, and adapts presentation to match user capacity. It splits overloaded steps, merges trivial ones, adjusts abstraction levels, and adds checkpoints — all without changing explanation content or correctness.
+
+### Architecture — LangGraph Cyclic StateGraph
+
+```mermaid
+graph LR
+    START((START)) --> EA[explanation_analyzer]
+    EA --> UST[user_state_tracker]
+    UST --> LE[load_estimator]
+    LE --> CE[control_engine]
+    CE --> GC[granularity_controller]
+    GC --> ER[explanation_restructurer]
+    ER --> FLM[feedback_loop_manager]
+    FLM -->|not converged| LE
+    FLM -->|converged| END1((END))
+
+    style EA fill:#e3f2fd
+    style UST fill:#fff3e0
+    style LE fill:#e8f5e9
+    style CE fill:#fce4ec
+    style GC fill:#f3e5f5
+    style ER fill:#fff9c4
+    style FLM fill:#e0f7fa
+```
+
+The graph is **cyclic** — the feedback loop manager conditionally routes back to the load estimator for re-optimization (up to 3 iterations or until load state reaches "optimal").
+
+### Cognitive Load State
+
+```python
+class CognitiveLoadState(TypedDict):
+    _llm_client: object              # Injected LLM client (optional)
+    raw_explanation: str             # Input explanation text
+    user_id: str                     # User identifier for state tracking
+    steps: list[dict]                # ExplanationStep dicts (from analyzer)
+    concept_transitions: list[str]   # Concept jump descriptions
+    abstraction_levels: list[str]    # Per-step abstraction levels
+    user_state: dict                 # UserCognitiveState dict (dynamic)
+    load_metrics: dict               # CognitiveLoadMetrics dict
+    load_state: str                  # overload / optimal / underload
+    reasoning_mode: str              # fine-grained / medium / coarse
+    control_actions: list[dict]      # ControlAction dicts
+    adapted_steps: list[dict]        # Restructured ExplanationStep dicts
+    iteration: int                   # Current feedback loop iteration
+    max_iterations: int              # Max loop iterations (default: 3)
+    converged: bool                  # Whether optimization has converged
+```
+
+### Node Responsibilities
+
+| Node | Reads | Writes | LLM? |
+|------|-------|--------|------|
+| `explanation_analyzer` | `raw_explanation` | `steps`, `concept_transitions`, `abstraction_levels` | Optional — sentence-split fallback |
+| `user_state_tracker` | `user_id` | `user_state` | No |
+| `load_estimator` | `steps`, `concept_transitions` | `load_metrics` | No |
+| `control_engine` | `load_metrics`, `user_state` | `load_state`, `reasoning_mode`, `control_actions` | No |
+| `granularity_controller` | `steps`, `load_state`, `control_actions` | `adapted_steps` | No |
+| `explanation_restructurer` | `adapted_steps`, `reasoning_mode` | `adapted_steps` (cleaned) | No |
+| `feedback_loop_manager` | `user_state`, `load_state`, `load_metrics`, `iteration` | `user_state`, `iteration`, `converged` | No |
+
+### Cognitive Load Computation
+
+Cognitive load is a composite score (0–10) derived from three dimensions:
+
+| Dimension | Formula | Weight |
+|-----------|---------|--------|
+| **Step Density** | `(num_steps / total_words) × 100` | ×2.0 |
+| **Concept Gap** | `new_concepts_per_transition / (num_steps - 1)` | ×2.5 |
+| **Memory Demand** | `max(dependencies + concepts)` across all steps | ×1.5 |
+
+**Total Load** = `min((step_density × 2.0) + (concept_gap × 2.5) + (memory_demand × 1.5), 10.0)`
+
+**User Capacity** = `(understanding_level × 5.0) + (reasoning_stability × 5.0)` (0–10 scale)
+
+### Adaptation Logic
+
+| Condition | State | Mode | Actions |
+|-----------|-------|------|---------|
+| `load > capacity + 1.5` | overload | fine-grained | Split long steps, add intermediate reasoning, reduce abstraction |
+| `load < capacity - 2.0` | underload | coarse | Merge short steps, compress reasoning, increase abstraction |
+| Within range | optimal | medium | Maintain structure, add checkpoints if borderline |
+
+### Feedback Loop
+
+After each adaptation cycle, the feedback loop manager:
+
+1. **Updates user state** — adjusts understanding, stability, overload signals, learning speed
+2. **Checks convergence** — load state is "optimal" OR max iterations reached
+3. **Saves state** — persists to in-memory store for future interactions
+
+User state evolves:
+
+| Field | On Overload | On Underload | On Optimal |
+|-------|------------|-------------|------------|
+| `understanding_level` | −0.05 | +0.05 | unchanged |
+| `reasoning_stability` | −0.05 | +0.03 | +0.02 |
+| `learning_speed` | unchanged | unchanged | +0.02 |
+| `overload_signals` | +1 | −1 | unchanged |
+
+### User State Persistence
+
+User state is stored in an in-memory dictionary keyed by `user_id`. State persists across requests within the same process but is reset on server restart. Each user starts with default values (understanding=0.5, stability=0.5, speed=0.5, overload=0, interactions=0).
+
+### Cognitive Load Optimizer Limitations
+
+- **In-memory state only.** User state is lost on server restart.
+- **No LLM required.** The optimizer works fully without an LLM (sentence-split fallback for analysis).
+- **Content is never regenerated.** The optimizer reshapes structure only — it cannot fix incorrect explanations.
+- **Max 3 iterations per request.** The feedback loop caps at 3 cycles to prevent infinite loops.

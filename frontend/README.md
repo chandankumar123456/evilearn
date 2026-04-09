@@ -4,7 +4,7 @@
 
 ## Overview
 
-The frontend is a React single-page application built with Vite and Tailwind CSS. It provides four main views: a Validation Workspace for submitting text, a Documents view for managing the knowledge base, a Stress Test workspace for testing reasoning robustness, and a History Dashboard for reviewing past sessions. All data is fetched from the FastAPI backend via a REST API client.
+The frontend is a React single-page application built with Vite and Tailwind CSS. It provides four main views: a Validation Workspace for submitting text, a Documents view for managing the knowledge base, a Stress Test workspace for testing reasoning robustness, a Cognitive Load optimizer for adapting explanation complexity, and a History Dashboard for reviewing past sessions. All data is fetched from the FastAPI backend via a REST API client.
 
 ## Technology
 
@@ -31,6 +31,8 @@ graph TB
         HD[HistoryDashboard<br/>Session list & details]
         STW[StressTestWorkspace<br/>Stress test input form]
         STR[StressTestResults<br/>Robustness & failures display]
+        CLW[CognitiveLoadWorkspace<br/>Cognitive load optimizer form]
+        CLR[CognitiveLoadResults<br/>Load state & adapted steps]
     end
 
     subgraph "Shared Components"
@@ -48,6 +50,8 @@ graph TB
     App --> HD
     App --> STW
     STW --> STR
+    App --> CLW
+    CLW --> CLR
     RD --> CC
     CC --> EV
 
@@ -56,6 +60,7 @@ graph TB
     CC --> API
     HD --> API
     STW --> API
+    CLW --> API
 
     API -->|REST| BE[Backend API<br/>FastAPI]
 ```
@@ -70,8 +75,10 @@ graph TD
     App --> HistoryDashboard
     App --> StressTestWorkspace
     App --> ThinkingSimulationWorkspace
+    App --> CognitiveLoadWorkspace
     StressTestWorkspace --> StressTestResults
     ThinkingSimulationWorkspace --> ThinkingSimulationResults
+    CognitiveLoadWorkspace --> CognitiveLoadResults
     ResultsDisplay --> ClaimCard
     ClaimCard --> EvidenceViewer
 ```
@@ -93,6 +100,7 @@ The root component managing tab navigation and global state.
 - **Documents** — Upload and manage knowledge base files
 - **Stress Test** — Test reasoning robustness with adversarial analysis
 - **Thinking Simulator** — Graph-based cognitive reasoning simulation
+- **Cognitive Load** — Cognitive load optimization for explanations
 - **History** — Browse past validation sessions
 
 **Data flow:**
@@ -357,6 +365,67 @@ Displays graph-based cognitive reasoning simulation results.
 
 **Empty state:** If no results, the component returns null.
 
+---
+
+### CognitiveLoadWorkspace (`components/CognitiveLoadWorkspace.jsx`)
+
+Input form for the Cognitive Load Optimizer.
+
+| State | Type | Default | Description |
+|-------|------|---------|-------------|
+| `explanation` | `string` | `""` | Explanation text to optimize (required) |
+| `userId` | `string` | `"default"` | User identifier for state tracking |
+| `processing` | `bool` | `false` | True during API call |
+| `error` | `string` | `""` | Error message |
+| `results` | `object` | `null` | CognitiveLoadResponse |
+
+**Behavior:**
+- Calls `optimizeCognitiveLoad(explanation, userId)` on submit
+- Passes `results` to `CognitiveLoadResults`
+- Displays error message on failure
+- Submit button uses teal accent color (`bg-teal-600`)
+
+---
+
+### CognitiveLoadResults (`components/CognitiveLoadResults.jsx`)
+
+Displays cognitive load optimization results with load state, metrics, adaptation actions, adapted explanation steps, and user cognitive state.
+
+**Props:**
+
+| Prop | Type | Description |
+|------|------|-------------|
+| `results` | `object` | `CognitiveLoadResponse` from backend |
+
+**Display sections:**
+
+1. **Status Badges** — Load state (🔴 overload / 🟢 optimal / 🟡 underload) and reasoning mode (fine-grained / medium / coarse)
+2. **Cognitive Load Metrics** — Grid showing step density, concept gap, memory demand, and total load
+3. **Adaptation Actions** — List of control actions taken (e.g., "Reducing complexity: splitting steps", "Increasing abstraction: skipping basics")
+4. **Adapted Explanation** — Step-by-step display with:
+   - Step ID and abstraction level badge
+   - Color-coded left border by abstraction level (green=concrete, yellow=semi-abstract, red=abstract, blue=checkpoint)
+   - Step content text
+   - Concept tags
+5. **User Cognitive State** — Progress bars for understanding level, reasoning stability, and learning speed; interaction count and overload signal count
+
+**Color coding:**
+
+| Abstraction Level | Border Color | Badge Color |
+|-------------------|-------------|-------------|
+| concrete | Green | Green |
+| semi-abstract | Yellow | Yellow |
+| abstract | Red | Red |
+| checkpoint | Blue | Blue |
+
+| Load State | Badge |
+|------------|-------|
+| overload | Red |
+| optimal | Green |
+| underload | Yellow |
+
+**Empty state:** If no results, the component returns null.
+
 ## API Client (`api.js`)
 
 All API calls go through `/api` prefix, which Vite proxies to `http://localhost:8000` in development.
@@ -372,6 +441,7 @@ All API calls go through `/api` prefix, which Vite proxies to `http://localhost:
 | `getHistory()` | GET | `/api/history` | — | `{sessions: [...]}` |
 | `evaluateReasoning(problem, studentAnswer, confidence)` | POST | `/api/evaluate-reasoning` | `{problem, student_answer, confidence}` | `EvaluateReasoningResponse` |
 | `simulateThinking(problem, studentAnswer)` | POST | `/api/simulate-thinking` | `{problem, student_answer}` | `ThinkingSimulationResponse` |
+| `optimizeCognitiveLoad(explanation, userId)` | POST | `/api/optimize-cognitive-load` | `{explanation, user_id}` | `CognitiveLoadResponse` |
 
 **Error handling pattern:** All functions check `res.ok`. On failure, they attempt to parse the error body for `detail`, falling back to a generic message. Errors are thrown as `Error` objects.
 
@@ -393,6 +463,8 @@ flowchart LR
     I -->|results| J[StressTestResults]
     A -->|ThinkingSimulationResponse| K[ThinkingSimulationWorkspace]
     K -->|results| L[ThinkingSimulationResults]
+    A -->|CognitiveLoadResponse| M[CognitiveLoadWorkspace]
+    M -->|results| N[CognitiveLoadResults]
 ```
 
 ### Outgoing (Frontend → Backend)
@@ -405,6 +477,7 @@ flowchart LR
     G[ClaimCard Edit] -->|new_claim_text| H[POST /edit-claim]
     I[StressTestWorkspace] -->|problem, answer, confidence| J[POST /evaluate-reasoning]
     K[ThinkingSimulationWorkspace] -->|problem, student_answer| L[POST /simulate-thinking]
+    M[CognitiveLoadWorkspace] -->|explanation, user_id| N[POST /optimize-cognitive-load]
 ```
 
 ## Error Handling
@@ -423,6 +496,8 @@ flowchart LR
 | Document list fetch fails | DocumentUpload | Fails silently (empty list shown) |
 | Empty stress test answer | StressTestWorkspace | "Please enter a student answer to stress-test." |
 | Stress test engine fails | StressTestWorkspace | Red error banner with API error message |
+| Empty explanation text | CognitiveLoadWorkspace | "Please enter an explanation to optimize." |
+| Cognitive load optimization fails | CognitiveLoadWorkspace | Red error banner with API error message |
 
 ## Dev Server Configuration
 

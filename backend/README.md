@@ -377,6 +377,80 @@ graph TB
 | 400 | Empty problem text |
 | 500 | Thinking simulation engine failure |
 
+### Optimize Cognitive Load
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/optimize-cognitive-load` | Optimize explanation cognitive load for a user |
+
+**Request Schema — `CognitiveLoadRequest`:**
+```json
+{
+  "explanation": "First, we identify the problem. Then, we recall the power rule...",
+  "user_id": "default"
+}
+```
+
+| Field | Type | Validation |
+|-------|------|------------|
+| `explanation` | `string` | Required, `min_length=1` — raw explanation text to optimize |
+| `user_id` | `string` | Optional, default `"default"` — user identifier for state tracking |
+
+**Response Schema — `CognitiveLoadResponse`:**
+```json
+{
+  "adapted_explanation": [
+    {
+      "step_id": "s1",
+      "content": "First, identify the problem type...",
+      "concepts": ["problem recognition"],
+      "abstraction_level": "concrete",
+      "depends_on": []
+    }
+  ],
+  "load_state": "optimal",
+  "control_actions": [
+    {
+      "action": "maintain",
+      "reason": "Load matches capacity — maintaining current structure"
+    }
+  ],
+  "user_state": {
+    "user_id": "default",
+    "understanding_level": 0.5,
+    "reasoning_stability": 0.52,
+    "learning_speed": 0.52,
+    "overload_signals": 0,
+    "interaction_count": 1
+  },
+  "load_metrics": {
+    "step_density": 3.33,
+    "concept_gap": 1.0,
+    "memory_demand": 2.0,
+    "total_load": 5.16
+  },
+  "reasoning_mode": "medium"
+}
+```
+
+**Key Schemas:**
+
+| Schema | Description |
+|--------|-------------|
+| `ExplanationStep` | step_id, content, concepts, abstraction_level (concrete/semi-abstract/abstract), depends_on |
+| `UserCognitiveState` | user_id, understanding_level, reasoning_stability, learning_speed, overload_signals, interaction_count |
+| `CognitiveLoadMetrics` | step_density, concept_gap, memory_demand, total_load |
+| `ControlAction` | action, reason |
+
+**Error Codes:**
+
+| Status | Cause |
+|--------|-------|
+| 400 | Empty explanation text |
+| 500 | Cognitive load optimizer failure |
+
+---
+
 ## Pipeline Orchestration
 
 ```mermaid
@@ -447,6 +521,33 @@ sequenceDiagram
     FastAPI-->>Client: ThinkingSimulationResponse
 ```
 
+### Cognitive Load Optimization Orchestration
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant FastAPI as FastAPI (app.py)
+    participant CLO as CognitiveLoadOptimizer
+
+    Client->>FastAPI: POST /optimize-cognitive-load
+    FastAPI->>FastAPI: Validate request (CognitiveLoadRequest)
+    FastAPI->>CLO: optimizer.optimize(explanation, user_id)
+    CLO->>CLO: graph.invoke(initial_state)
+    Note over CLO: Node 1: Analyze explanation into steps, concepts, abstraction
+    Note over CLO: Node 2: Load/initialize user cognitive state
+    Note over CLO: Node 3: Compute cognitive load (step density, concept gap, memory)
+    Note over CLO: Node 4: Compare load vs capacity → overload/optimal/underload
+    Note over CLO: Node 5: Adjust granularity (split/merge/checkpoint)
+    Note over CLO: Node 6: Validate and clean restructured steps
+    Note over CLO: Node 7: Update user state, decide loop/end
+    alt Load not optimal & iterations remaining
+        Note over CLO: Loop back to Node 3 (re-estimate load)
+    end
+    CLO-->>FastAPI: adapted explanation + load state + user state
+    FastAPI->>FastAPI: Validate via CognitiveLoadResponse schemas
+    FastAPI-->>Client: CognitiveLoadResponse
+```
+
 ## Request & Output Validation (Pydantic Schemas)
 
 All request bodies are validated by Pydantic v2 models defined in `schemas.py`:
@@ -458,6 +559,7 @@ All request bodies are validated by Pydantic v2 models defined in `schemas.py`:
 | `EditClaimRequest` | `claim_id`, `session_id`, `new_claim_text` | `new_claim_text` has `min_length=1` |
 | `EvaluateReasoningRequest` | `problem`, `student_answer`, `confidence` | `student_answer` has `min_length=1`, `confidence` ∈ [0, 100] |
 | `ThinkingSimulationRequest` | `problem`, `student_answer` | `problem` has `min_length=1` |
+| `CognitiveLoadRequest` | `explanation`, `user_id` | `explanation` has `min_length=1` |
 
 **Output validation (BEFORE storage):**
 
@@ -474,6 +576,11 @@ All request bodies are validated by Pydantic v2 models defined in `schemas.py`:
 | `ReasoningNode` | `step_id`, `operation_type`, `concept_used`, `abstraction_level`, `strategy_type` | `abstraction_level` ∈ {LOW, MEDIUM, HIGH}, `strategy_type` ∈ {direct_application, rule_based, transformation, reduction, optimization} |
 | `ReasoningEdge` | `from_step_id`, `to_step_id`, `relation_type` | `relation_type` ∈ {derives, transforms, simplifies} |
 | `GapItem` | `insight`, `severity`, `source` | `severity` ∈ {info, warning, critical}, `source` ∈ {structural, strategy, abstraction, comparison} |
+| `CognitiveLoadResponse` | `adapted_explanation`, `load_state`, `control_actions`, `user_state`, `load_metrics`, `reasoning_mode` | `load_state` ∈ {overload, optimal, underload}, `reasoning_mode` ∈ {fine-grained, medium, coarse} |
+| `ExplanationStep` | `step_id`, `content`, `concepts`, `abstraction_level`, `depends_on` | `abstraction_level` ∈ {concrete, semi-abstract, abstract} |
+| `UserCognitiveState` | `user_id`, `understanding_level`, `reasoning_stability`, `learning_speed`, `overload_signals`, `interaction_count` | Levels ∈ [0.0, 1.0], counts ≥ 0 |
+| `CognitiveLoadMetrics` | `step_density`, `concept_gap`, `memory_demand`, `total_load` | All ≥ 0.0 |
+| `ControlAction` | `action`, `reason` | Both non-empty strings |
 
 All pipeline output is validated via `ClaimResult` **before** being inserted into the database. If validation fails, the request is rejected with HTTP 500.
 
