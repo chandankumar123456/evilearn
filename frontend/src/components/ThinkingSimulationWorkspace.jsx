@@ -38,10 +38,10 @@ function ThinkingSimulationWorkspace() {
           <h2 className="text-lg font-semibold text-gray-900">Thinking Simulation Engine</h2>
         </div>
         <p className="text-sm text-gray-500 mb-6">
-          Simulate how different cognitive levels (beginner, intermediate, expert) reason about a problem.
-          The system analyzes reasoning structure, strategy differences, and abstraction levels —
-          it does NOT solve problems or check correctness.
-          Optionally provide a student answer to identify thinking gaps.
+          Graph-based cognitive reasoning simulator. Generates structured reasoning graphs
+          (nodes + edges + decisions) for three cognitive levels with strict constraint enforcement.
+          Compares graph shape, strategy distribution, and abstraction flow — not surface-level text.
+          Optionally provide a student answer to convert into the same graph structure and identify structural gaps.
         </p>
 
         {/* Problem (mandatory) */}
