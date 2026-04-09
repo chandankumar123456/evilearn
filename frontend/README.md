@@ -4,7 +4,7 @@
 
 ## Overview
 
-The frontend is a React single-page application built with Vite and Tailwind CSS. It provides four main views: a Validation Workspace for submitting text, a Documents view for managing the knowledge base, a Stress Test workspace for testing reasoning robustness, a Cognitive Load optimizer for adapting explanation complexity, and a History Dashboard for reviewing past sessions. All data is fetched from the FastAPI backend via a REST API client.
+The frontend is a React single-page application built with Vite and Tailwind CSS. It provides five main views: a Validation Workspace for submitting text, a Documents view for managing the knowledge base, a Stress Test workspace for testing reasoning robustness, a Cognitive Load optimizer for adapting explanation complexity, and a History Dashboard for reviewing past sessions. All data is fetched from the FastAPI backend via a REST API client.
 
 ## Technology
 
