@@ -772,10 +772,16 @@ def gap_generator_node(state: ThinkingState) -> dict:
         level_match = student_comp.get("student_level_match", "unknown")
 
         if level_match != "unknown":
+            level_descriptions = {
+                "beginner": "direct application",
+                "intermediate": "rule-based application",
+                "expert": "transformation-based reasoning",
+            }
+            level_desc = level_descriptions.get(level_match, level_match)
             gaps.append({
                 "insight": (
                     f"Your approach follows {level_match}-level reasoning: "
-                    f"{'direct application' if level_match == 'beginner' else 'rule-based application' if level_match == 'intermediate' else 'transformation-based reasoning'}"
+                    f"{level_desc}"
                 ),
                 "severity": "info" if level_match == "expert" else "warning",
             })
