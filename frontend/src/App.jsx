@@ -3,6 +3,7 @@ import DocumentUpload from './components/DocumentUpload';
 import ValidationWorkspace from './components/ValidationWorkspace';
 import ResultsDisplay from './components/ResultsDisplay';
 import HistoryDashboard from './components/HistoryDashboard';
+import StressTestWorkspace from './components/StressTestWorkspace';
 
 function App() {
   const [activeTab, setActiveTab] = useState('workspace');
@@ -16,6 +17,7 @@ function App() {
 
   const tabs = [
     { id: 'workspace', label: 'Validation Workspace' },
+    { id: 'stress-test', label: 'Stress Test' },
     { id: 'documents', label: 'Documents' },
     { id: 'history', label: 'History' },
   ];
@@ -37,7 +39,9 @@ function App() {
                   onClick={() => setActiveTab(tab.id)}
                   className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
                     activeTab === tab.id
-                      ? 'bg-blue-600 text-white'
+                      ? tab.id === 'stress-test'
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-blue-600 text-white'
                       : 'text-gray-600 hover:bg-gray-100'
                   }`}
                 >
@@ -61,6 +65,8 @@ function App() {
             )}
           </div>
         )}
+
+        {activeTab === 'stress-test' && <StressTestWorkspace />}
 
         {activeTab === 'history' && <HistoryDashboard />}
       </main>

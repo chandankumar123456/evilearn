@@ -67,3 +67,20 @@ export async function getHistory() {
   if (!res.ok) throw new Error('Failed to fetch history');
   return res.json();
 }
+
+export async function evaluateReasoning(studentAnswer, problem = '', confidence = 50) {
+  const res = await fetch(`${API_BASE}/evaluate-reasoning`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      student_answer: studentAnswer,
+      problem,
+      confidence,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Stress test failed');
+  }
+  return res.json();
+}
