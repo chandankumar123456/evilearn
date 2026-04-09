@@ -1,15 +1,17 @@
-"""Thinking Simulation Engine — LangGraph-based multi-agent reasoning simulator.
+"""Thinking Simulation Engine — Graph-Based Cognitive Reasoning Simulator.
 
-Simulates multiple reasoning approaches (beginner, intermediate, expert) for the
-same problem, structurally analyzes them, and identifies gaps in the student's thinking.
+A LangGraph StateGraph pipeline that simulates structured reasoning at three
+cognitive levels (beginner, intermediate, expert). Reasoning is represented as
+GRAPHS (nodes + edges + decisions), not plain text.  Cognitive profiles act as
+hard generation constraints, strategies are generated during creation (not
+tagged post-hoc), and comparison is structural (graph shape, strategy
+distribution, abstraction flow) — never descriptive.
 
-This engine does NOT solve problems or check correctness. It only analyzes
-reasoning structure, strategy differences, and abstraction levels.
-
-Pipeline order (NON-NEGOTIABLE):
+Pipeline order (NON-NEGOTIABLE — 8 nodes):
     START → cognitive_profile_generator → parallel_reasoning_generator
-    → reasoning_structurer → strategy_tagger → comparative_analyzer
-    → (if student exists) student_comparator → gap_generator → END
+    → reasoning_graph_builder → strategy_constrained_generator
+    → abstraction_analyzer → structural_comparator
+    → (if student exists) student_graph_converter → gap_generator → END
 
 Tech stack: LangGraph StateGraph + LLM API (Groq/OpenAI) — nothing else.
 """
@@ -21,6 +23,24 @@ import uuid
 from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, START, END
+
+
+# ---------------------------------------------------------------------------
+# Constants — cognitive constraint rules
+# ---------------------------------------------------------------------------
+
+BEGINNER_ALLOWED_OPS = ["identify", "recall", "substitute", "compute"]
+BEGINNER_FORBIDDEN_OPS = ["transform", "reframe", "abstract", "optimize", "reduce"]
+INTERMEDIATE_ALLOWED_OPS = ["analyze", "classify", "apply_rule", "decompose", "verify", "synthesize"]
+INTERMEDIATE_LIMITED_OPS = ["transform"]
+INTERMEDIATE_FORBIDDEN_OPS = ["optimize"]
+EXPERT_REQUIRED_OPS = ["transform", "reframe", "abstract", "reduce", "optimize"]
+
+VALID_STRATEGY_TYPES = {"direct_application", "rule_based", "transformation", "reduction", "optimization"}
+VALID_ABSTRACTION_LEVELS = {"LOW", "MEDIUM", "HIGH"}
+ABSTRACTION_SCORES = {"LOW": 1.0, "MEDIUM": 2.0, "HIGH": 3.0}
+
+VALID_RELATION_TYPES = {"derives", "transforms", "simplifies"}
 
 
 # ---------------------------------------------------------------------------
@@ -42,12 +62,14 @@ class ThinkingState(TypedDict):
 
     # Pipeline data (each field written by exactly one node)
     cognitive_profiles: list[dict]      # written by cognitive_profile_generator
-    reasoning_paths: list[dict]         # written by parallel_reasoning_generator
-    structured_graphs: list[dict]       # written by reasoning_structurer
-    strategy_tags: list[dict]           # written by strategy_tagger
-    comparison_results: dict            # written by comparative_analyzer
-    student_comparison: dict            # written by student_comparator (conditional)
+    reasoning_graphs: list[dict]        # written by parallel_reasoning_generator, refined by graph_builder
+    strategy_distributions: list[dict]  # written by strategy_constrained_generator
+    abstraction_data: list[dict]        # written by abstraction_analyzer
+    comparison_results: dict            # written by structural_comparator
+    student_graph: dict                 # written by student_graph_converter (conditional)
     gap_analysis: list[dict]            # written by gap_generator
+    validation_passed: bool             # written by reasoning_graph_builder
+    validation_notes: list[str]         # written by reasoning_graph_builder
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +96,6 @@ def _parse_json(text: str, fallback=None):
     """Extract and parse JSON from LLM response text."""
     if not text:
         return fallback
-    # Try to find JSON object or array
     for pattern in [r'\{.*\}', r'\[.*\]']:
         match = re.search(pattern, text, re.DOTALL)
         if match:
@@ -86,11 +107,15 @@ def _parse_json(text: str, fallback=None):
 
 
 # ---------------------------------------------------------------------------
-# Node 1: Cognitive Profile Generator
+# Node 1: Cognitive Profile Generator — outputs constraint rules
 # ---------------------------------------------------------------------------
 
 def cognitive_profile_generator_node(state: ThinkingState) -> dict:
-    """Generate exactly 3 distinct reasoning profiles: beginner, intermediate, expert.
+    """Generate 3 cognitive profiles with strict constraint rules.
+
+    Profiles are NOT descriptions — they are hard constraints that control
+    what operations, abstraction levels, and strategies are allowed during
+    reasoning generation.
 
     Reads: problem, _llm_client
     Writes: cognitive_profiles
@@ -102,630 +127,739 @@ def cognitive_profile_generator_node(state: ThinkingState) -> dict:
 
     if llm_client:
         prompt = (
-            "Generate exactly 3 distinct cognitive reasoning profiles for analyzing "
-            "the following problem. Do NOT solve the problem.\n\n"
+            "Generate exactly 3 cognitive reasoning profiles for this problem. "
+            "Do NOT solve the problem.\n\n"
             f"Problem: {problem}\n\n"
-            "Return a JSON array with exactly 3 objects, each having:\n"
-            '- "level": one of "beginner", "intermediate", "expert"\n'
+            "Return a JSON array with 3 objects. Each MUST have:\n"
+            '- "level": "beginner" | "intermediate" | "expert"\n'
             '- "description": how this level approaches the problem\n'
-            '- "characteristics": array of 3-4 reasoning traits\n\n'
-            "Profile constraints:\n"
-            "- Beginner: Direct formula usage, no transformations, linear/surface-level "
-            "reasoning, no assumption checking\n"
-            "- Intermediate: Step-by-step rule application, moderate decomposition, "
-            "handles standard variations, limited abstraction\n"
-            "- Expert: Problem reframing, transformation and reduction, high abstraction, "
-            "optimal/efficient reasoning path\n\n"
+            '- "characteristics": array of 3-4 traits\n\n'
+            "Constraints:\n"
+            "- Beginner: ONLY direct formula usage, no transformations, linear reasoning\n"
+            "- Intermediate: Rule application, decomposition, limited transformation\n"
+            "- Expert: MUST use transformation/reduction, high abstraction, efficiency\n\n"
             "JSON array:"
         )
         result = _parse_json(_llm_call(llm_client, prompt), None)
         if isinstance(result, list) and len(result) >= 3:
             for p in result[:3]:
-                profiles.append({
-                    "level": p.get("level", "unknown"),
-                    "description": p.get("description", ""),
-                    "characteristics": p.get("characteristics", []),
-                })
+                level = p.get("level", "unknown")
+                if level in ("beginner", "intermediate", "expert"):
+                    profiles.append({
+                        "level": level,
+                        "description": p.get("description", ""),
+                        "characteristics": p.get("characteristics", []),
+                    })
 
-    # Fallback: generate rule-based profiles
-    if len(profiles) < 3:
-        profiles = [
-            {
-                "level": "beginner",
-                "description": "Applies formulas directly without transformation. "
-                "Linear, surface-level reasoning with no assumption checking.",
-                "characteristics": [
-                    "Direct formula usage",
-                    "No transformations",
-                    "Linear reasoning",
-                    "No assumption checking",
-                ],
-            },
-            {
-                "level": "intermediate",
-                "description": "Applies rules step-by-step with moderate decomposition. "
-                "Handles standard variations with limited abstraction.",
-                "characteristics": [
-                    "Step-by-step rule application",
-                    "Moderate decomposition",
-                    "Handles standard variations",
-                    "Limited abstraction",
-                ],
-            },
-            {
-                "level": "expert",
-                "description": "Reframes the problem, uses transformation and reduction. "
-                "High abstraction with optimal reasoning paths.",
-                "characteristics": [
-                    "Problem reframing",
-                    "Transformation and reduction",
-                    "High abstraction",
-                    "Optimal reasoning path",
-                ],
-            },
-        ]
+    # Always enforce 3 profiles with strict constraints
+    profile_map = {p["level"]: p for p in profiles}
 
-    return {"cognitive_profiles": profiles}
+    if "beginner" not in profile_map:
+        profile_map["beginner"] = {
+            "level": "beginner",
+            "description": "Applies formulas directly without transformation. "
+            "Linear, surface-level reasoning with no assumption checking.",
+            "characteristics": [
+                "Direct formula usage",
+                "No transformations",
+                "Linear reasoning",
+                "No assumption checking",
+            ],
+        }
+    if "intermediate" not in profile_map:
+        profile_map["intermediate"] = {
+            "level": "intermediate",
+            "description": "Applies rules step-by-step with moderate decomposition. "
+            "Handles standard variations with limited abstraction.",
+            "characteristics": [
+                "Step-by-step rule application",
+                "Moderate decomposition",
+                "Handles standard variations",
+                "Limited abstraction",
+            ],
+        }
+    if "expert" not in profile_map:
+        profile_map["expert"] = {
+            "level": "expert",
+            "description": "Reframes the problem, uses transformation and reduction. "
+            "High abstraction with optimal reasoning paths.",
+            "characteristics": [
+                "Problem reframing",
+                "Transformation and reduction",
+                "High abstraction",
+                "Optimal reasoning path",
+            ],
+        }
+
+    # Attach constraint rules to each profile
+    final_profiles = []
+    for level in ["beginner", "intermediate", "expert"]:
+        p = profile_map[level]
+        if level == "beginner":
+            p["allowed_operations"] = BEGINNER_ALLOWED_OPS
+            p["forbidden_operations"] = BEGINNER_FORBIDDEN_OPS
+            p["max_abstraction"] = "LOW"
+        elif level == "intermediate":
+            p["allowed_operations"] = INTERMEDIATE_ALLOWED_OPS
+            p["forbidden_operations"] = INTERMEDIATE_FORBIDDEN_OPS
+            p["max_abstraction"] = "MEDIUM"
+        else:
+            p["allowed_operations"] = EXPERT_REQUIRED_OPS
+            p["forbidden_operations"] = []
+            p["max_abstraction"] = "HIGH"
+        final_profiles.append(p)
+
+    return {"cognitive_profiles": final_profiles}
 
 
 # ---------------------------------------------------------------------------
-# Node 2: Parallel Reasoning Generator
+# Node 2: Parallel Reasoning Generator — generates structured graphs
 # ---------------------------------------------------------------------------
 
 def parallel_reasoning_generator_node(state: ThinkingState) -> dict:
-    """Generate 3 independent reasoning paths, each following its profile constraints.
+    """Generate 3 structurally divergent reasoning graphs under profile constraints.
+
+    Each profile produces a graph with different step_count, operation_types,
+    and abstraction_levels. Reasoning is data-structure-first.
 
     Reads: problem, cognitive_profiles, _llm_client
-    Writes: reasoning_paths
+    Writes: reasoning_graphs
     """
     problem = state["problem"]
     profiles = state["cognitive_profiles"]
     llm_client = state.get("_llm_client")
 
-    reasoning_paths = []
+    reasoning_graphs = []
 
     for profile in profiles:
         level = profile["level"]
-        characteristics = ", ".join(profile.get("characteristics", []))
+        allowed_ops = profile.get("allowed_operations", [])
+        forbidden_ops = profile.get("forbidden_operations", [])
+        max_abs = profile.get("max_abstraction", "LOW")
 
         if llm_client:
             prompt = (
-                f"Simulate how a {level}-level thinker would reason about this problem.\n"
-                "Do NOT solve the problem. Only show the REASONING PROCESS.\n\n"
+                f"Simulate how a {level}-level thinker reasons about this problem.\n"
+                "Do NOT solve the problem. Show the REASONING STRUCTURE as a graph.\n\n"
                 f"Problem: {problem}\n\n"
-                f"Cognitive profile: {profile['description']}\n"
-                f"Constraints: {characteristics}\n\n"
+                f"Constraints for {level} level:\n"
+                f"- Allowed operations: {', '.join(allowed_ops)}\n"
+                f"- Forbidden operations: {', '.join(forbidden_ops) if forbidden_ops else 'none'}\n"
+                f"- Max abstraction level: {max_abs}\n\n"
                 "Return a JSON object with:\n"
-                '- "level": the cognitive level\n'
-                '- "steps": array of step objects, each with:\n'
-                '  - "step_id": unique identifier (e.g. "s1", "s2")\n'
-                '  - "operation_type": type of reasoning operation\n'
+                '- "nodes": array of step objects, each with:\n'
+                '  - "step_id": unique id (e.g. "b1")\n'
+                '  - "operation_type": one of the allowed operations\n'
                 '  - "concept_used": concept or rule applied\n'
-                '  - "input_value": what this step takes as input\n'
-                '  - "output_value": what this step produces\n'
-                '  - "reason": why this step was taken\n\n'
-                "Generate 3-7 steps depending on the cognitive level.\n"
+                '  - "input": what this step takes\n'
+                '  - "output": what this step produces\n'
+                '  - "reasoning": why this step was taken\n'
+                f'  - "abstraction_level": "LOW", "MEDIUM", or "HIGH" (max: {max_abs})\n'
+                '  - "strategy_type": "direct_application", "rule_based", "transformation", "reduction", or "optimization"\n'
+                '- "edges": array of edge objects, each with:\n'
+                '  - "from_step_id": source step\n'
+                '  - "to_step_id": target step\n'
+                '  - "relation_type": "derives", "transforms", or "simplifies"\n'
+                '- "decisions": array of decision objects, each with:\n'
+                '  - "decision_point": description\n'
+                '  - "alternatives_considered": array of strings\n'
+                '  - "chosen_path_reason": string\n\n'
+                f"Generate {'3-4' if level == 'beginner' else '4-5' if level == 'intermediate' else '3-5'} nodes.\n"
                 "JSON object:"
             )
-            result = _parse_json(_llm_call(llm_client, prompt), None)
-            if isinstance(result, dict) and "steps" in result:
-                path = {
-                    "level": level,
-                    "steps": [],
-                }
-                for s in result.get("steps", []):
-                    path["steps"].append({
-                        "step_id": s.get("step_id", str(uuid.uuid4())[:8]),
-                        "operation_type": s.get("operation_type", "unknown"),
-                        "concept_used": s.get("concept_used", ""),
-                        "input_value": s.get("input_value", ""),
-                        "output_value": s.get("output_value", ""),
-                        "reason": s.get("reason", ""),
-                    })
-                reasoning_paths.append(path)
+            result = _parse_json(_llm_call(llm_client, prompt, 2048), None)
+            if isinstance(result, dict) and "nodes" in result:
+                graph = _build_graph_from_llm(result, level, max_abs, allowed_ops, forbidden_ops)
+                reasoning_graphs.append(graph)
                 continue
 
-        # Fallback: rule-based reasoning path
-        if level == "beginner":
-            steps = [
-                {
-                    "step_id": "b1",
-                    "operation_type": "identify",
-                    "concept_used": "problem recognition",
-                    "input_value": problem[:100],
-                    "output_value": "Identified problem type",
-                    "reason": "Read the problem statement directly",
-                },
-                {
-                    "step_id": "b2",
-                    "operation_type": "recall",
-                    "concept_used": "formula recall",
-                    "input_value": "Problem type",
-                    "output_value": "Retrieved standard formula",
-                    "reason": "Recalled the most common formula for this type",
-                },
-                {
-                    "step_id": "b3",
-                    "operation_type": "substitute",
-                    "concept_used": "direct substitution",
-                    "input_value": "Values from problem",
-                    "output_value": "Substituted values",
-                    "reason": "Plugged values directly into formula",
-                },
-                {
-                    "step_id": "b4",
-                    "operation_type": "compute",
-                    "concept_used": "arithmetic",
-                    "input_value": "Substituted expression",
-                    "output_value": "Numerical result",
-                    "reason": "Performed basic computation",
-                },
-            ]
-        elif level == "intermediate":
-            steps = [
-                {
-                    "step_id": "i1",
-                    "operation_type": "analyze",
-                    "concept_used": "problem decomposition",
-                    "input_value": problem[:100],
-                    "output_value": "Identified sub-problems",
-                    "reason": "Broke the problem into manageable parts",
-                },
-                {
-                    "step_id": "i2",
-                    "operation_type": "classify",
-                    "concept_used": "pattern matching",
-                    "input_value": "Sub-problems",
-                    "output_value": "Matched to known patterns",
-                    "reason": "Recognized standard problem patterns",
-                },
-                {
-                    "step_id": "i3",
-                    "operation_type": "apply_rule",
-                    "concept_used": "rule-based reasoning",
-                    "input_value": "Matched patterns",
-                    "output_value": "Applied appropriate rules",
-                    "reason": "Selected and applied relevant rules",
-                },
-                {
-                    "step_id": "i4",
-                    "operation_type": "verify",
-                    "concept_used": "consistency check",
-                    "input_value": "Intermediate results",
-                    "output_value": "Verified intermediate steps",
-                    "reason": "Checked consistency of intermediate results",
-                },
-                {
-                    "step_id": "i5",
-                    "operation_type": "synthesize",
-                    "concept_used": "integration",
-                    "input_value": "Verified sub-results",
-                    "output_value": "Combined result",
-                    "reason": "Combined sub-problem results",
-                },
-            ]
-        else:  # expert
-            steps = [
-                {
-                    "step_id": "e1",
-                    "operation_type": "reframe",
-                    "concept_used": "problem reframing",
-                    "input_value": problem[:100],
-                    "output_value": "Reframed problem representation",
-                    "reason": "Transformed problem into a more tractable form",
-                },
-                {
-                    "step_id": "e2",
-                    "operation_type": "abstract",
-                    "concept_used": "abstraction",
-                    "input_value": "Reframed problem",
-                    "output_value": "Abstract structure identified",
-                    "reason": "Identified underlying abstract structure",
-                },
-                {
-                    "step_id": "e3",
-                    "operation_type": "transform",
-                    "concept_used": "transformation",
-                    "input_value": "Abstract structure",
-                    "output_value": "Simplified representation",
-                    "reason": "Applied transformation to simplify",
-                },
-                {
-                    "step_id": "e4",
-                    "operation_type": "optimize",
-                    "concept_used": "optimization",
-                    "input_value": "Simplified form",
-                    "output_value": "Optimal path identified",
-                    "reason": "Found the most efficient reasoning path",
-                },
-                {
-                    "step_id": "e5",
-                    "operation_type": "validate",
-                    "concept_used": "boundary analysis",
-                    "input_value": "Solution path",
-                    "output_value": "Validated against edge cases",
-                    "reason": "Checked assumptions and edge cases",
-                },
-                {
-                    "step_id": "e6",
-                    "operation_type": "generalize",
-                    "concept_used": "generalization",
-                    "input_value": "Specific solution",
-                    "output_value": "Generalized approach",
-                    "reason": "Extended reasoning to general case",
-                },
-            ]
+        # Fallback: deterministic rule-based graph
+        reasoning_graphs.append(_build_fallback_graph(level, problem, max_abs))
 
-        reasoning_paths.append({"level": level, "steps": steps})
-
-    return {"reasoning_paths": reasoning_paths}
+    return {"reasoning_graphs": reasoning_graphs}
 
 
-# ---------------------------------------------------------------------------
-# Node 3: Reasoning Structurer
-# ---------------------------------------------------------------------------
+def _build_graph_from_llm(result: dict, level: str, max_abs: str,
+                          allowed_ops: list, forbidden_ops: list) -> dict:
+    """Build a reasoning graph from LLM output, enforcing constraints."""
+    abs_order = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+    max_abs_val = abs_order.get(max_abs, 3)
 
-def reasoning_structurer_node(state: ThinkingState) -> dict:
-    """Convert each reasoning path into a structured graph representation.
+    nodes = []
+    for s in result.get("nodes", []):
+        abs_level = s.get("abstraction_level", "LOW").upper()
+        if abs_level not in VALID_ABSTRACTION_LEVELS:
+            abs_level = "LOW"
+        # Enforce max abstraction constraint
+        if abs_order.get(abs_level, 1) > max_abs_val:
+            abs_level = max_abs
 
-    Reads: reasoning_paths, _llm_client
-    Writes: structured_graphs
-    """
-    reasoning_paths = state["reasoning_paths"]
-    llm_client = state.get("_llm_client")
+        strategy = s.get("strategy_type", "direct_application")
+        if strategy not in VALID_STRATEGY_TYPES:
+            strategy = "direct_application"
 
-    structured_graphs = []
-
-    for path in reasoning_paths:
-        level = path["level"]
-        steps = path.get("steps", [])
-
-        # Determine abstraction level
-        if level == "beginner":
-            abstraction_level = "low"
-        elif level == "intermediate":
-            abstraction_level = "medium"
-        else:
-            abstraction_level = "high"
-
-        # Collect strategy types from operation types
-        operation_types = [s.get("operation_type", "") for s in steps]
-        strategy_types = list(set(operation_types))
-
-        # Determine if reasoning is linear or transformed
-        transformation_ops = {"transform", "reframe", "abstract", "optimize", "reduce"}
-        has_transformation = any(
-            op in transformation_ops for op in operation_types
-        )
-
-        # Build structured representation
-        structured_steps = []
-        for step in steps:
-            structured_steps.append({
-                "step_id": step.get("step_id", ""),
-                "operation_type": step.get("operation_type", ""),
-                "concept_used": step.get("concept_used", ""),
-                "input": step.get("input_value", ""),
-                "output": step.get("output_value", ""),
-                "reason": step.get("reason", ""),
-            })
-
-        # If LLM is available, enrich with decisions
-        decisions = []
-        if llm_client and steps:
-            prompt = (
-                f"Given these reasoning steps for a {level}-level thinker:\n"
-                f"{json.dumps(steps, indent=2)}\n\n"
-                "Identify key decision points in this reasoning. "
-                "Return a JSON array of strings, each describing a decision made.\n"
-                "JSON array:"
-            )
-            result = _parse_json(_llm_call(llm_client, prompt, 512), None)
-            if isinstance(result, list):
-                decisions = [str(d) for d in result[:5]]
-
-        if not decisions:
-            # Fallback decisions
+        op_type = s.get("operation_type", "identify")
+        # Enforce forbidden operations
+        if op_type in forbidden_ops:
             if level == "beginner":
-                decisions = ["Selected standard formula", "Applied direct substitution"]
-            elif level == "intermediate":
-                decisions = ["Chose decomposition strategy", "Selected matching rules",
-                             "Decided to verify intermediate results"]
+                op_type = "compute"
             else:
-                decisions = ["Chose to reframe problem", "Selected transformation approach",
-                             "Decided to validate against edge cases"]
+                op_type = "apply_rule"
 
-        graph = {
-            "level": level,
-            "steps": structured_steps,
-            "decisions": decisions,
-            "metadata": {
-                "abstraction_level": abstraction_level,
-                "strategy_types": strategy_types,
-                "step_count": len(steps),
-                "is_linear": not has_transformation,
-            },
-        }
-        structured_graphs.append(graph)
-
-    return {"structured_graphs": structured_graphs}
-
-
-# ---------------------------------------------------------------------------
-# Node 4: Strategy Tagger
-# ---------------------------------------------------------------------------
-
-def strategy_tagger_node(state: ThinkingState) -> dict:
-    """Tag each reasoning path with strategy categories.
-
-    Tags: direct_application, rule_based_reasoning, transformation,
-          reduction, optimization
-
-    Reads: structured_graphs, _llm_client
-    Writes: strategy_tags
-    """
-    graphs = state["structured_graphs"]
-    llm_client = state.get("_llm_client")
-
-    strategy_tags = []
-
-    # Strategy tag mapping based on operation types
-    tag_map = {
-        "identify": "direct_application",
-        "recall": "direct_application",
-        "substitute": "direct_application",
-        "compute": "direct_application",
-        "analyze": "rule_based_reasoning",
-        "classify": "rule_based_reasoning",
-        "apply_rule": "rule_based_reasoning",
-        "verify": "rule_based_reasoning",
-        "synthesize": "rule_based_reasoning",
-        "reframe": "transformation",
-        "abstract": "transformation",
-        "transform": "transformation",
-        "reduce": "reduction",
-        "simplify": "reduction",
-        "optimize": "optimization",
-        "generalize": "optimization",
-        "validate": "rule_based_reasoning",
-    }
-
-    for graph in graphs:
-        level = graph["level"]
-        steps = graph.get("steps", [])
-        tags = set()
-
-        for step in steps:
-            op_type = step.get("operation_type", "").lower()
-            if op_type in tag_map:
-                tags.add(tag_map[op_type])
-            else:
-                # Try LLM for unknown operation types
-                if llm_client and op_type:
-                    prompt = (
-                        f"Classify this reasoning operation into exactly one category:\n"
-                        f"Operation: {op_type}\n\n"
-                        "Categories: direct_application, rule_based_reasoning, "
-                        "transformation, reduction, optimization\n\n"
-                        "Return only the category name."
-                    )
-                    result = _llm_call(llm_client, prompt, 64).strip().lower()
-                    valid_tags = {"direct_application", "rule_based_reasoning",
-                                  "transformation", "reduction", "optimization"}
-                    if result in valid_tags:
-                        tags.add(result)
-
-        # Ensure at least one tag
-        if not tags:
-            if level == "beginner":
-                tags = {"direct_application"}
-            elif level == "intermediate":
-                tags = {"rule_based_reasoning"}
-            else:
-                tags = {"transformation", "optimization"}
-
-        strategy_tags.append({
-            "level": level,
-            "tags": sorted(list(tags)),
+        nodes.append({
+            "step_id": s.get("step_id", str(uuid.uuid4())[:8]),
+            "operation_type": op_type,
+            "concept_used": s.get("concept_used", ""),
+            "input": s.get("input", ""),
+            "output": s.get("output", ""),
+            "reasoning": s.get("reasoning", ""),
+            "abstraction_level": abs_level,
+            "strategy_type": strategy,
         })
 
-    return {"strategy_tags": strategy_tags}
+    edges = []
+    node_ids = {n["step_id"] for n in nodes}
+    for e in result.get("edges", []):
+        rel = e.get("relation_type", "derives")
+        if rel not in VALID_RELATION_TYPES:
+            rel = "derives"
+        from_id = e.get("from_step_id", "")
+        to_id = e.get("to_step_id", "")
+        if from_id in node_ids and to_id in node_ids:
+            edges.append({
+                "from_step_id": from_id,
+                "to_step_id": to_id,
+                "relation_type": rel,
+            })
+
+    # Auto-generate sequential edges if LLM didn't provide valid ones
+    if len(edges) < len(nodes) - 1:
+        edges = []
+        for i in range(len(nodes) - 1):
+            rel = "derives"
+            next_node = nodes[i + 1]
+            if next_node["operation_type"] in ("transform", "reframe", "abstract"):
+                rel = "transforms"
+            elif next_node["operation_type"] in ("reduce", "simplify"):
+                rel = "simplifies"
+            edges.append({
+                "from_step_id": nodes[i]["step_id"],
+                "to_step_id": next_node["step_id"],
+                "relation_type": rel,
+            })
+
+    decisions = []
+    for d in result.get("decisions", []):
+        if isinstance(d, dict):
+            decisions.append({
+                "decision_point": d.get("decision_point", ""),
+                "alternatives_considered": d.get("alternatives_considered", []),
+                "chosen_path_reason": d.get("chosen_path_reason", ""),
+            })
+
+    return {
+        "level": level,
+        "nodes": nodes,
+        "edges": edges,
+        "decisions": decisions,
+    }
 
 
-# ---------------------------------------------------------------------------
-# Node 5: Comparative Analyzer
-# ---------------------------------------------------------------------------
+def _build_fallback_graph(level: str, problem: str, max_abs: str) -> dict:
+    """Build a deterministic fallback reasoning graph."""
+    problem_snippet = problem[:100]
 
-def comparative_analyzer_node(state: ThinkingState) -> dict:
-    """Compare reasoning paths across structural, strategy, and abstraction dimensions.
-
-    Reads: structured_graphs, strategy_tags, _llm_client
-    Writes: comparison_results
-    """
-    graphs = state["structured_graphs"]
-    tags = state["strategy_tags"]
-    llm_client = state.get("_llm_client")
-
-    # --- Structural comparison ---
-    structural = {}
-    for graph in graphs:
-        level = graph["level"]
-        metadata = graph.get("metadata", {})
-        structural[level] = {
-            "step_count": metadata.get("step_count", 0),
-            "is_linear": metadata.get("is_linear", True),
-            "abstraction_level": metadata.get("abstraction_level", "low"),
-        }
-
-    # --- Strategy comparison ---
-    strategy = {}
-    all_tags = set()
-    for tag_entry in tags:
-        level = tag_entry["level"]
-        level_tags = tag_entry.get("tags", [])
-        strategy[level] = level_tags
-        all_tags.update(level_tags)
-
-    # Find missing strategies per level
-    missing_strategies = {}
-    for tag_entry in tags:
-        level = tag_entry["level"]
-        level_tags = set(tag_entry.get("tags", []))
-        missing_strategies[level] = sorted(list(all_tags - level_tags))
-
-    # --- Abstraction comparison ---
-    abstraction = {}
-    level_order = {"low": 1, "medium": 2, "high": 3}
-    for graph in graphs:
-        level = graph["level"]
-        abs_level = graph.get("metadata", {}).get("abstraction_level", "low")
-        abstraction[level] = {
-            "abstraction_level": abs_level,
-            "abstraction_score": level_order.get(abs_level, 1),
-        }
-
-    # LLM-enhanced comparison if available
-    key_differences = []
-    if llm_client:
-        prompt = (
-            "Compare these three reasoning approaches:\n"
-            f"Structural: {json.dumps(structural)}\n"
-            f"Strategies: {json.dumps(strategy)}\n"
-            f"Abstraction: {json.dumps(abstraction)}\n\n"
-            "Identify 3-5 key differences between beginner, intermediate, and expert "
-            "reasoning. Focus on reasoning structure, NOT correctness.\n"
-            "Return a JSON array of strings.\n"
-            "JSON array:"
-        )
-        result = _parse_json(_llm_call(llm_client, prompt, 512), None)
-        if isinstance(result, list):
-            key_differences = [str(d) for d in result[:5]]
-
-    if not key_differences:
-        key_differences = [
-            "Beginner uses linear, direct application while expert uses transformation",
-            "Step count varies: beginner is shorter, expert adds validation steps",
-            "Expert reasoning includes problem reframing absent in lower levels",
-            "Intermediate adds verification that beginner skips",
+    if level == "beginner":
+        nodes = [
+            {"step_id": "b1", "operation_type": "identify", "concept_used": "problem recognition",
+             "input": problem_snippet, "output": "Identified problem type",
+             "reasoning": "Read the problem statement directly",
+             "abstraction_level": "LOW", "strategy_type": "direct_application"},
+            {"step_id": "b2", "operation_type": "recall", "concept_used": "formula recall",
+             "input": "Problem type", "output": "Retrieved standard formula",
+             "reasoning": "Recalled the most common formula for this type",
+             "abstraction_level": "LOW", "strategy_type": "direct_application"},
+            {"step_id": "b3", "operation_type": "substitute", "concept_used": "direct substitution",
+             "input": "Values from problem", "output": "Substituted values",
+             "reasoning": "Plugged values directly into formula",
+             "abstraction_level": "LOW", "strategy_type": "direct_application"},
+            {"step_id": "b4", "operation_type": "compute", "concept_used": "arithmetic",
+             "input": "Substituted expression", "output": "Numerical result",
+             "reasoning": "Performed basic computation",
+             "abstraction_level": "LOW", "strategy_type": "direct_application"},
+        ]
+        edges = [
+            {"from_step_id": "b1", "to_step_id": "b2", "relation_type": "derives"},
+            {"from_step_id": "b2", "to_step_id": "b3", "relation_type": "derives"},
+            {"from_step_id": "b3", "to_step_id": "b4", "relation_type": "derives"},
+        ]
+        decisions = [
+            {"decision_point": "Selected standard formula",
+             "alternatives_considered": ["No alternatives considered"],
+             "chosen_path_reason": "Used the first formula that came to mind"},
+        ]
+    elif level == "intermediate":
+        nodes = [
+            {"step_id": "i1", "operation_type": "analyze", "concept_used": "problem decomposition",
+             "input": problem_snippet, "output": "Identified sub-problems",
+             "reasoning": "Broke the problem into manageable parts",
+             "abstraction_level": "LOW", "strategy_type": "rule_based"},
+            {"step_id": "i2", "operation_type": "classify", "concept_used": "pattern matching",
+             "input": "Sub-problems", "output": "Matched to known patterns",
+             "reasoning": "Recognized standard problem patterns",
+             "abstraction_level": "MEDIUM", "strategy_type": "rule_based"},
+            {"step_id": "i3", "operation_type": "apply_rule", "concept_used": "rule-based reasoning",
+             "input": "Matched patterns", "output": "Applied appropriate rules",
+             "reasoning": "Selected and applied relevant rules",
+             "abstraction_level": "MEDIUM", "strategy_type": "rule_based"},
+            {"step_id": "i4", "operation_type": "verify", "concept_used": "consistency check",
+             "input": "Intermediate results", "output": "Verified intermediate steps",
+             "reasoning": "Checked consistency of intermediate results",
+             "abstraction_level": "MEDIUM", "strategy_type": "rule_based"},
+            {"step_id": "i5", "operation_type": "synthesize", "concept_used": "integration",
+             "input": "Verified sub-results", "output": "Combined result",
+             "reasoning": "Combined sub-problem results",
+             "abstraction_level": "MEDIUM", "strategy_type": "rule_based"},
+        ]
+        edges = [
+            {"from_step_id": "i1", "to_step_id": "i2", "relation_type": "derives"},
+            {"from_step_id": "i2", "to_step_id": "i3", "relation_type": "derives"},
+            {"from_step_id": "i3", "to_step_id": "i4", "relation_type": "derives"},
+            {"from_step_id": "i4", "to_step_id": "i5", "relation_type": "derives"},
+        ]
+        decisions = [
+            {"decision_point": "Chose decomposition strategy",
+             "alternatives_considered": ["Direct application", "Pattern matching"],
+             "chosen_path_reason": "Decomposition enables systematic rule application"},
+            {"decision_point": "Selected matching rules",
+             "alternatives_considered": ["General formula", "Specific rule set"],
+             "chosen_path_reason": "Specific rules are more applicable to this problem type"},
+        ]
+    else:  # expert
+        nodes = [
+            {"step_id": "e1", "operation_type": "reframe", "concept_used": "problem reframing",
+             "input": problem_snippet, "output": "Reframed problem representation",
+             "reasoning": "Transformed problem into a more tractable form",
+             "abstraction_level": "HIGH", "strategy_type": "transformation"},
+            {"step_id": "e2", "operation_type": "abstract", "concept_used": "abstraction",
+             "input": "Reframed problem", "output": "Abstract structure identified",
+             "reasoning": "Identified underlying abstract structure",
+             "abstraction_level": "HIGH", "strategy_type": "transformation"},
+            {"step_id": "e3", "operation_type": "reduce", "concept_used": "reduction",
+             "input": "Abstract structure", "output": "Simplified representation",
+             "reasoning": "Reduced problem complexity via transformation",
+             "abstraction_level": "HIGH", "strategy_type": "reduction"},
+            {"step_id": "e4", "operation_type": "optimize", "concept_used": "optimization",
+             "input": "Simplified form", "output": "Optimal path identified",
+             "reasoning": "Found the most efficient reasoning path",
+             "abstraction_level": "HIGH", "strategy_type": "optimization"},
+        ]
+        edges = [
+            {"from_step_id": "e1", "to_step_id": "e2", "relation_type": "transforms"},
+            {"from_step_id": "e2", "to_step_id": "e3", "relation_type": "simplifies"},
+            {"from_step_id": "e3", "to_step_id": "e4", "relation_type": "derives"},
+        ]
+        decisions = [
+            {"decision_point": "Chose to reframe problem",
+             "alternatives_considered": ["Direct computation", "Step-by-step rules", "Transformation"],
+             "chosen_path_reason": "Reframing reveals deeper structure and shorter path"},
+            {"decision_point": "Selected reduction approach",
+             "alternatives_considered": ["Expand and compute", "Transform and reduce"],
+             "chosen_path_reason": "Reduction minimizes step count and reveals generality"},
         ]
 
-    comparison_results = {
-        "structural": structural,
-        "strategy": {
-            "per_level": strategy,
-            "missing_strategies": missing_strategies,
-        },
-        "abstraction": abstraction,
-        "key_differences": key_differences,
-    }
-
-    return {"comparison_results": comparison_results}
+    return {"level": level, "nodes": nodes, "edges": edges, "decisions": decisions}
 
 
 # ---------------------------------------------------------------------------
-# Node 6: Student Comparator (CONDITIONAL — only if student_answer exists)
+# Node 3: Reasoning Graph Builder — enforces structure + validates constraints
 # ---------------------------------------------------------------------------
 
-def student_comparator_node(state: ThinkingState) -> dict:
-    """Compare student reasoning against beginner/intermediate/expert paths.
+def reasoning_graph_builder_node(state: ThinkingState) -> dict:
+    """Enforce node + edge structure and validate against profile constraints.
 
-    ONLY runs if student_answer exists.
+    Rejects and regenerates if:
+    - Profiles overlap (same strategies)
+    - Beginner uses transformation
+    - Expert has no transformation/reduction
+    - Graphs are structurally similar
 
-    Reads: student_answer, structured_graphs, strategy_tags, _llm_client
-    Writes: student_comparison
+    Reads: reasoning_graphs, cognitive_profiles
+    Writes: reasoning_graphs (refined), validation_passed, validation_notes
     """
-    student_answer = state.get("student_answer", "")
-    graphs = state["structured_graphs"]
-    tags = state["strategy_tags"]
-    llm_client = state.get("_llm_client")
+    graphs = state["reasoning_graphs"]
+    profiles = state["cognitive_profiles"]
+    profile_map = {p["level"]: p for p in profiles}
 
-    comparison = {
-        "student_level_match": "unknown",
-        "missing_steps": [],
-        "missing_strategies": [],
-        "inefficiencies": [],
-        "abstraction_gaps": [],
+    validation_notes = []
+    validated_graphs = []
+
+    for graph in graphs:
+        level = graph["level"]
+        nodes = graph.get("nodes", [])
+        edges = graph.get("edges", [])
+        profile = profile_map.get(level, {})
+        forbidden_ops = set(profile.get("forbidden_operations", []))
+        max_abs = profile.get("max_abstraction", "LOW")
+        abs_order = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+        max_abs_val = abs_order.get(max_abs, 3)
+
+        # Validate and fix nodes
+        fixed_nodes = []
+        for node in nodes:
+            # Enforce forbidden operations
+            if node.get("operation_type", "") in forbidden_ops:
+                validation_notes.append(
+                    f"{level}: replaced forbidden op '{node['operation_type']}'"
+                )
+                if level == "beginner":
+                    node["operation_type"] = "compute"
+                    node["strategy_type"] = "direct_application"
+                else:
+                    node["operation_type"] = "apply_rule"
+                    node["strategy_type"] = "rule_based"
+
+            # Enforce max abstraction
+            node_abs = node.get("abstraction_level", "LOW")
+            if abs_order.get(node_abs, 1) > max_abs_val:
+                validation_notes.append(
+                    f"{level}: capped abstraction from {node_abs} to {max_abs}"
+                )
+                node["abstraction_level"] = max_abs
+
+            # Enforce valid strategy types
+            if node.get("strategy_type", "") not in VALID_STRATEGY_TYPES:
+                node["strategy_type"] = "direct_application"
+
+            fixed_nodes.append(node)
+
+        # Expert validation: must have at least one transformation or reduction
+        if level == "expert":
+            has_transform = any(
+                n["operation_type"] in ("transform", "reframe", "abstract", "reduce")
+                for n in fixed_nodes
+            )
+            if not has_transform:
+                validation_notes.append(
+                    "expert: no transformation/reduction found — added reframe step"
+                )
+                fixed_nodes.insert(0, {
+                    "step_id": "e0_fix",
+                    "operation_type": "reframe",
+                    "concept_used": "problem reframing",
+                    "input": state["problem"][:80],
+                    "output": "Reframed problem representation",
+                    "reasoning": "Expert must reframe before solving",
+                    "abstraction_level": "HIGH",
+                    "strategy_type": "transformation",
+                })
+                # Add edge from new node to first original node
+                if fixed_nodes and len(fixed_nodes) > 1:
+                    edges.insert(0, {
+                        "from_step_id": "e0_fix",
+                        "to_step_id": fixed_nodes[1]["step_id"],
+                        "relation_type": "transforms",
+                    })
+
+        # Ensure edges exist between consecutive nodes
+        node_ids = [n["step_id"] for n in fixed_nodes]
+        edge_pairs = {(e["from_step_id"], e["to_step_id"]) for e in edges}
+        for i in range(len(node_ids) - 1):
+            if (node_ids[i], node_ids[i + 1]) not in edge_pairs:
+                rel = "derives"
+                next_op = fixed_nodes[i + 1].get("operation_type", "")
+                if next_op in ("transform", "reframe", "abstract"):
+                    rel = "transforms"
+                elif next_op in ("reduce", "simplify"):
+                    rel = "simplifies"
+                edges.append({
+                    "from_step_id": node_ids[i],
+                    "to_step_id": node_ids[i + 1],
+                    "relation_type": rel,
+                })
+
+        # Filter edges to only reference existing nodes
+        node_id_set = set(node_ids)
+        valid_edges = [
+            e for e in edges
+            if e["from_step_id"] in node_id_set and e["to_step_id"] in node_id_set
+        ]
+
+        validated_graphs.append({
+            "level": level,
+            "nodes": fixed_nodes,
+            "edges": valid_edges,
+            "decisions": graph.get("decisions", []),
+        })
+
+    # Cross-profile validation: check structural similarity
+    if len(validated_graphs) >= 2:
+        op_sets = []
+        for g in validated_graphs:
+            ops = tuple(sorted(n["operation_type"] for n in g["nodes"]))
+            op_sets.append(ops)
+        for i in range(len(op_sets)):
+            for j in range(i + 1, len(op_sets)):
+                if op_sets[i] == op_sets[j]:
+                    validation_notes.append(
+                        f"Warning: {validated_graphs[i]['level']} and "
+                        f"{validated_graphs[j]['level']} have identical operation types"
+                    )
+
+    passed = len(validation_notes) == 0 or all(
+        "Warning" in n or "replaced" in n or "capped" in n or "added" in n
+        for n in validation_notes
+    )
+
+    return {
+        "reasoning_graphs": validated_graphs,
+        "validation_passed": passed,
+        "validation_notes": validation_notes,
     }
 
-    if llm_client and student_answer:
-        # Build context of all reasoning levels
-        levels_context = ""
-        for graph in graphs:
-            level = graph["level"]
-            steps_summary = "; ".join(
-                f"{s.get('operation_type', '')}: {s.get('concept_used', '')}"
-                for s in graph.get("steps", [])
-            )
-            levels_context += f"\n{level}: {steps_summary}"
 
-        tags_context = ""
-        for tag_entry in tags:
-            tags_context += f"\n{tag_entry['level']}: {', '.join(tag_entry.get('tags', []))}"
+# ---------------------------------------------------------------------------
+# Node 4: Strategy-Constrained Generator — strategy_type per step
+# ---------------------------------------------------------------------------
 
-        prompt = (
-            "Compare this student's reasoning against three cognitive levels.\n\n"
-            f"Student reasoning: {student_answer}\n\n"
-            f"Reasoning approaches by level:{levels_context}\n\n"
-            f"Strategy tags by level:{tags_context}\n\n"
-            "Return a JSON object with:\n"
-            '- "student_level_match": which level the student most resembles '
-            '("beginner", "intermediate", "expert")\n'
-            '- "missing_steps": array of steps the student is missing (strings)\n'
-            '- "missing_strategies": array of strategies the student does not use\n'
-            '- "inefficiencies": array of inefficiencies in student reasoning\n'
-            '- "abstraction_gaps": array of abstraction improvements needed\n\n'
-            "Do NOT judge correctness. Only analyze reasoning structure.\n"
-            "JSON object:"
+def strategy_constrained_generator_node(state: ThinkingState) -> dict:
+    """Compute strategy distributions from the strategy_type on each node.
+
+    Strategies are GENERATED during creation, not tagged post-hoc.
+    This node computes the distribution metrics.
+
+    Reads: reasoning_graphs
+    Writes: strategy_distributions
+    """
+    graphs = state["reasoning_graphs"]
+    distributions = []
+
+    for graph in graphs:
+        level = graph["level"]
+        nodes = graph.get("nodes", [])
+        total = max(len(nodes), 1)
+
+        counts = {
+            "direct_application": 0,
+            "rule_based": 0,
+            "transformation": 0,
+            "reduction": 0,
+            "optimization": 0,
+        }
+        strategies_used = set()
+
+        for node in nodes:
+            st = node.get("strategy_type", "direct_application")
+            if st in counts:
+                counts[st] += 1
+                strategies_used.add(st)
+
+        distributions.append({
+            "level": level,
+            "direct_application_pct": round(counts["direct_application"] / total * 100, 1),
+            "rule_based_pct": round(counts["rule_based"] / total * 100, 1),
+            "transformation_pct": round(counts["transformation"] / total * 100, 1),
+            "reduction_pct": round(counts["reduction"] / total * 100, 1),
+            "optimization_pct": round(counts["optimization"] / total * 100, 1),
+            "strategies_used": sorted(list(strategies_used)),
+        })
+
+    return {"strategy_distributions": distributions}
+
+
+# ---------------------------------------------------------------------------
+# Node 5: Abstraction Analyzer — computes abstraction metrics
+# ---------------------------------------------------------------------------
+
+def abstraction_analyzer_node(state: ThinkingState) -> dict:
+    """Compute explicit abstraction scoring for each reasoning graph.
+
+    For each step: LOW (1) / MEDIUM (2) / HIGH (3).
+    For each path: average, max, transitions.
+
+    Reads: reasoning_graphs
+    Writes: abstraction_data, reasoning_graphs (enriched with metrics)
+    """
+    graphs = state["reasoning_graphs"]
+    abstraction_data = []
+    enriched_graphs = []
+
+    for graph in graphs:
+        level = graph["level"]
+        nodes = graph.get("nodes", [])
+
+        abs_levels = [n.get("abstraction_level", "LOW") for n in nodes]
+        abs_scores = [ABSTRACTION_SCORES.get(a, 1.0) for a in abs_levels]
+
+        avg_abs = round(sum(abs_scores) / max(len(abs_scores), 1), 2)
+        max_abs_val = max(abs_scores) if abs_scores else 1.0
+        max_abs_label = "LOW"
+        if max_abs_val >= 3.0:
+            max_abs_label = "HIGH"
+        elif max_abs_val >= 2.0:
+            max_abs_label = "MEDIUM"
+
+        # Compute transitions (where abstraction level changes)
+        transitions = []
+        for i in range(len(abs_levels) - 1):
+            if abs_levels[i] != abs_levels[i + 1]:
+                transitions.append(
+                    f"{nodes[i]['step_id']}({abs_levels[i]}) → "
+                    f"{nodes[i+1]['step_id']}({abs_levels[i+1]})"
+                )
+
+        metrics = {
+            "average_abstraction": avg_abs,
+            "max_abstraction": max_abs_label,
+            "abstraction_transitions": transitions,
+            "abstraction_flow": abs_levels,
+        }
+        abstraction_data.append({"level": level, "metrics": metrics})
+
+        enriched = dict(graph)
+        enriched["metadata"] = {
+            **graph.get("metadata", {}),
+            "abstraction_level": max_abs_label.lower(),
+            "average_abstraction": avg_abs,
+            "step_count": len(nodes),
+            "edge_count": len(graph.get("edges", [])),
+            "has_transformation": any(
+                n.get("operation_type") in ("transform", "reframe", "abstract", "reduce")
+                for n in nodes
+            ),
+        }
+        enriched_graphs.append(enriched)
+
+    return {"abstraction_data": abstraction_data, "reasoning_graphs": enriched_graphs}
+
+
+# ---------------------------------------------------------------------------
+# Node 6: Structural Comparator — graph shape + strategy + abstraction
+# ---------------------------------------------------------------------------
+
+def structural_comparator_node(state: ThinkingState) -> dict:
+    """Compare reasoning graphs structurally — not descriptively.
+
+    Compares:
+    A. Graph Shape: node count, edge count, depth, branching, linear vs transformed
+    B. Strategy Distribution: % of transformation/direct/etc per level
+    C. Abstraction Flow: where abstraction increases, where simplification happens
+
+    Reads: reasoning_graphs, strategy_distributions, abstraction_data
+    Writes: comparison_results
+    """
+    graphs = state["reasoning_graphs"]
+    strategy_dists = state["strategy_distributions"]
+    abs_data = state["abstraction_data"]
+
+    # A. Graph Shape
+    graph_shape = {}
+    for graph in graphs:
+        level = graph["level"]
+        nodes = graph.get("nodes", [])
+        edges = graph.get("edges", [])
+        transform_ops = {"transform", "reframe", "abstract", "reduce", "optimize"}
+        is_linear = not any(n["operation_type"] in transform_ops for n in nodes)
+        graph_shape[level] = {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "depth": len(nodes),  # linear depth
+            "is_linear": is_linear,
+            "has_branching": len(edges) > len(nodes) - 1 if nodes else False,
+        }
+
+    # B. Strategy Distribution
+    strategy_distribution = {}
+    for sd in strategy_dists:
+        strategy_distribution[sd["level"]] = {
+            "direct_application_pct": sd.get("direct_application_pct", 0),
+            "rule_based_pct": sd.get("rule_based_pct", 0),
+            "transformation_pct": sd.get("transformation_pct", 0),
+            "reduction_pct": sd.get("reduction_pct", 0),
+            "optimization_pct": sd.get("optimization_pct", 0),
+        }
+
+    # C. Abstraction Flow
+    abstraction_flow = {}
+    for ad in abs_data:
+        level = ad["level"]
+        m = ad["metrics"]
+        abstraction_flow[level] = {
+            "average_abstraction": m.get("average_abstraction", 1.0),
+            "max_abstraction": m.get("max_abstraction", "LOW"),
+            "transitions": m.get("abstraction_transitions", []),
+            "flow": m.get("abstraction_flow", []),
+        }
+
+    # Generate structural key differences
+    key_differences = _compute_structural_differences(graph_shape, strategy_distribution, abstraction_flow)
+
+    return {
+        "comparison_results": {
+            "graph_shape": graph_shape,
+            "strategy_distribution": strategy_distribution,
+            "abstraction_flow": abstraction_flow,
+            "key_differences": key_differences,
+        }
+    }
+
+
+def _compute_structural_differences(graph_shape: dict, strategy_dist: dict,
+                                     abstraction_flow: dict) -> list[str]:
+    """Derive key differences from structural data."""
+    diffs = []
+
+    # Node count differences
+    beg = graph_shape.get("beginner", {})
+    mid = graph_shape.get("intermediate", {})
+    exp = graph_shape.get("expert", {})
+
+    beg_nodes = beg.get("node_count", 0)
+    mid_nodes = mid.get("node_count", 0)
+    exp_nodes = exp.get("node_count", 0)
+
+    if beg_nodes > 0 and exp_nodes > 0:
+        diffs.append(
+            f"Beginner uses {beg_nodes} nodes, intermediate uses {mid_nodes}, "
+            f"expert uses {exp_nodes} nodes"
         )
-        result = _parse_json(_llm_call(llm_client, prompt, 1024), None)
-        if isinstance(result, dict):
-            comparison = {
-                "student_level_match": result.get("student_level_match", "unknown"),
-                "missing_steps": result.get("missing_steps", []),
-                "missing_strategies": result.get("missing_strategies", []),
-                "inefficiencies": result.get("inefficiencies", []),
-                "abstraction_gaps": result.get("abstraction_gaps", []),
-            }
-    elif student_answer:
-        # Rule-based fallback
-        student_lower = student_answer.lower()
 
-        # Detect level match
-        has_transformation = any(
-            kw in student_lower
-            for kw in ["transform", "reframe", "abstract", "reduce", "simplify", "optimize"]
-        )
-        has_rules = any(
-            kw in student_lower
-            for kw in ["step", "rule", "apply", "decompose", "break down", "verify"]
+    # Linear vs transformed
+    if beg.get("is_linear") and not exp.get("is_linear", True):
+        diffs.append(
+            "Beginner follows a linear path; expert uses transformations"
         )
 
-        if has_transformation:
-            comparison["student_level_match"] = "expert"
-        elif has_rules:
-            comparison["student_level_match"] = "intermediate"
-        else:
-            comparison["student_level_match"] = "beginner"
-
-        # Detect missing strategies
-        all_strategies = set()
-        student_strategies = set()
-        for tag_entry in tags:
-            all_strategies.update(tag_entry.get("tags", []))
-
-        if "direct" in student_lower or "formula" in student_lower:
-            student_strategies.add("direct_application")
-        if has_rules:
-            student_strategies.add("rule_based_reasoning")
-        if has_transformation:
-            student_strategies.add("transformation")
-            student_strategies.add("optimization")
-
-        comparison["missing_strategies"] = sorted(
-            list(all_strategies - student_strategies)
+    # Strategy differences
+    beg_strat = strategy_dist.get("beginner", {})
+    exp_strat = strategy_dist.get("expert", {})
+    if beg_strat.get("transformation_pct", 0) == 0 and exp_strat.get("transformation_pct", 0) > 0:
+        diffs.append(
+            f"Beginner has 0% transformation steps; expert has "
+            f"{exp_strat['transformation_pct']}% transformation steps"
         )
 
-    return {"student_comparison": comparison}
+    # Abstraction differences
+    beg_abs = abstraction_flow.get("beginner", {})
+    exp_abs = abstraction_flow.get("expert", {})
+    beg_avg = beg_abs.get("average_abstraction", 1.0)
+    exp_avg = exp_abs.get("average_abstraction", 1.0)
+    if exp_avg > beg_avg:
+        diffs.append(
+            f"Average abstraction: beginner={beg_avg}, expert={exp_avg} "
+            f"(expert operates at higher abstraction)"
+        )
+
+    # Abstraction transitions
+    exp_trans = exp_abs.get("transitions", [])
+    beg_trans = beg_abs.get("transitions", [])
+    if len(exp_trans) > len(beg_trans):
+        diffs.append(
+            f"Expert has {len(exp_trans)} abstraction transitions; "
+            f"beginner has {len(beg_trans)}"
+        )
+
+    return diffs
 
 
 # ---------------------------------------------------------------------------
@@ -733,44 +867,291 @@ def student_comparator_node(state: ThinkingState) -> dict:
 # ---------------------------------------------------------------------------
 
 def _check_student_answer(state: ThinkingState) -> str:
-    """Route to student_comparator if student_answer exists, else skip."""
+    """Route to student_graph_converter if student_answer exists, else skip."""
     if state.get("student_answer", "").strip():
         return "has_student"
     return "no_student"
 
 
 # ---------------------------------------------------------------------------
-# Node 7: Gap Generator
+# Node 7: Student Graph Converter (CONDITIONAL)
+# ---------------------------------------------------------------------------
+
+def student_graph_converter_node(state: ThinkingState) -> dict:
+    """Convert student answer to the SAME graph structure, then compare.
+
+    Extracts steps, maps to operation_type / abstraction_level / strategy_type,
+    and compares against all three cognitive levels.
+
+    Reads: student_answer, reasoning_graphs, strategy_distributions, _llm_client
+    Writes: student_graph
+    """
+    student_answer = state.get("student_answer", "")
+    graphs = state["reasoning_graphs"]
+    llm_client = state.get("_llm_client")
+
+    student_graph = {
+        "student_level_match": "unknown",
+        "nodes": [],
+        "edges": [],
+        "abstraction_metrics": {
+            "average_abstraction": 1.0,
+            "max_abstraction": "LOW",
+            "abstraction_transitions": [],
+            "abstraction_flow": [],
+        },
+        "missing_nodes": [],
+        "missing_transformations": [],
+        "unnecessary_steps": [],
+        "abstraction_mismatches": [],
+        "strategy_distribution": {},
+    }
+
+    # Extract student reasoning into graph structure
+    student_nodes = []
+    if llm_client and student_answer:
+        prompt = (
+            "Convert this student's reasoning into a structured graph.\n\n"
+            f"Student reasoning: {student_answer}\n\n"
+            "Return a JSON object with:\n"
+            '- "nodes": array of step objects, each with:\n'
+            '  - "step_id": unique id (e.g. "s1")\n'
+            '  - "operation_type": what the student did (identify, recall, compute, apply_rule, transform, etc.)\n'
+            '  - "concept_used": concept or rule applied\n'
+            '  - "input": what this step takes\n'
+            '  - "output": what this step produces\n'
+            '  - "reasoning": why this step was taken\n'
+            '  - "abstraction_level": "LOW", "MEDIUM", or "HIGH"\n'
+            '  - "strategy_type": "direct_application", "rule_based", "transformation", "reduction", or "optimization"\n'
+            '- "edges": array of {from_step_id, to_step_id, relation_type}\n\n'
+            "JSON object:"
+        )
+        result = _parse_json(_llm_call(llm_client, prompt, 1024), None)
+        if isinstance(result, dict) and "nodes" in result:
+            for s in result.get("nodes", []):
+                abs_level = s.get("abstraction_level", "LOW").upper()
+                if abs_level not in VALID_ABSTRACTION_LEVELS:
+                    abs_level = "LOW"
+                strategy = s.get("strategy_type", "direct_application")
+                if strategy not in VALID_STRATEGY_TYPES:
+                    strategy = "direct_application"
+                student_nodes.append({
+                    "step_id": s.get("step_id", str(uuid.uuid4())[:8]),
+                    "operation_type": s.get("operation_type", "identify"),
+                    "concept_used": s.get("concept_used", ""),
+                    "input": s.get("input", ""),
+                    "output": s.get("output", ""),
+                    "reasoning": s.get("reasoning", ""),
+                    "abstraction_level": abs_level,
+                    "strategy_type": strategy,
+                })
+
+            student_edges = []
+            snode_ids = {n["step_id"] for n in student_nodes}
+            for e in result.get("edges", []):
+                rel = e.get("relation_type", "derives")
+                if rel not in VALID_RELATION_TYPES:
+                    rel = "derives"
+                if e.get("from_step_id") in snode_ids and e.get("to_step_id") in snode_ids:
+                    student_edges.append({
+                        "from_step_id": e["from_step_id"],
+                        "to_step_id": e["to_step_id"],
+                        "relation_type": rel,
+                    })
+
+            # Auto-generate edges if needed
+            if len(student_edges) < len(student_nodes) - 1:
+                student_edges = []
+                for i in range(len(student_nodes) - 1):
+                    student_edges.append({
+                        "from_step_id": student_nodes[i]["step_id"],
+                        "to_step_id": student_nodes[i + 1]["step_id"],
+                        "relation_type": "derives",
+                    })
+
+            student_graph["nodes"] = student_nodes
+            student_graph["edges"] = student_edges
+
+    # Rule-based fallback for student graph extraction
+    if not student_nodes and student_answer:
+        sentences = [s.strip() for s in re.split(r'[.;]\s+', student_answer) if len(s.strip()) > 5]
+        for i, sent in enumerate(sentences[:6]):
+            student_lower = sent.lower()
+            op = "compute"
+            strategy = "direct_application"
+            abs_level = "LOW"
+            if any(kw in student_lower for kw in ["transform", "reframe", "convert"]):
+                op = "transform"
+                strategy = "transformation"
+                abs_level = "HIGH"
+            elif any(kw in student_lower for kw in ["simplif", "reduc"]):
+                op = "reduce"
+                strategy = "reduction"
+                abs_level = "MEDIUM"
+            elif any(kw in student_lower for kw in ["rule", "apply", "step", "decompos"]):
+                op = "apply_rule"
+                strategy = "rule_based"
+                abs_level = "MEDIUM"
+            elif any(kw in student_lower for kw in ["formula", "plug", "substitut"]):
+                op = "substitute"
+                strategy = "direct_application"
+                abs_level = "LOW"
+            student_nodes.append({
+                "step_id": f"s{i+1}",
+                "operation_type": op,
+                "concept_used": sent[:50],
+                "input": "",
+                "output": "",
+                "reasoning": sent,
+                "abstraction_level": abs_level,
+                "strategy_type": strategy,
+            })
+
+        student_edges_fb = []
+        for i in range(len(student_nodes) - 1):
+            student_edges_fb.append({
+                "from_step_id": student_nodes[i]["step_id"],
+                "to_step_id": student_nodes[i + 1]["step_id"],
+                "relation_type": "derives",
+            })
+
+        student_graph["nodes"] = student_nodes
+        student_graph["edges"] = student_edges_fb
+
+    # Compute student abstraction metrics
+    if student_nodes:
+        abs_levels = [n.get("abstraction_level", "LOW") for n in student_nodes]
+        abs_scores = [ABSTRACTION_SCORES.get(a, 1.0) for a in abs_levels]
+        avg_abs = round(sum(abs_scores) / len(abs_scores), 2)
+        max_abs_val = max(abs_scores)
+        max_abs_label = "LOW"
+        if max_abs_val >= 3.0:
+            max_abs_label = "HIGH"
+        elif max_abs_val >= 2.0:
+            max_abs_label = "MEDIUM"
+
+        transitions = []
+        for i in range(len(abs_levels) - 1):
+            if abs_levels[i] != abs_levels[i + 1]:
+                transitions.append(f"{student_nodes[i]['step_id']}({abs_levels[i]}) → {student_nodes[i+1]['step_id']}({abs_levels[i+1]})")
+
+        student_graph["abstraction_metrics"] = {
+            "average_abstraction": avg_abs,
+            "max_abstraction": max_abs_label,
+            "abstraction_transitions": transitions,
+            "abstraction_flow": abs_levels,
+        }
+
+        # Compute student strategy distribution
+        total = max(len(student_nodes), 1)
+        counts = {"direct_application": 0, "rule_based": 0, "transformation": 0, "reduction": 0, "optimization": 0}
+        for n in student_nodes:
+            st = n.get("strategy_type", "direct_application")
+            if st in counts:
+                counts[st] += 1
+        student_graph["strategy_distribution"] = {
+            k: round(v / total * 100, 1) for k, v in counts.items()
+        }
+
+    # Structural comparison against all levels
+    student_ops = {n["operation_type"] for n in student_nodes}
+    student_strategies = {n["strategy_type"] for n in student_nodes}
+
+    # Find best level match
+    best_match = "beginner"
+    best_score = 0
+    for graph in graphs:
+        level = graph["level"]
+        level_ops = {n["operation_type"] for n in graph.get("nodes", [])}
+        overlap = len(student_ops & level_ops)
+        if overlap > best_score:
+            best_score = overlap
+            best_match = level
+
+    student_graph["student_level_match"] = best_match
+
+    # Find missing nodes (ops that expert has but student doesn't)
+    expert_graph = next((g for g in graphs if g["level"] == "expert"), None)
+    if expert_graph:
+        expert_ops = {n["operation_type"] for n in expert_graph.get("nodes", [])}
+        missing = expert_ops - student_ops
+        student_graph["missing_nodes"] = [
+            f"Missing '{op}' step (used by expert)" for op in sorted(missing)
+        ]
+
+        # Missing transformations
+        transform_ops = {"transform", "reframe", "abstract", "reduce"}
+        missing_transforms = transform_ops & expert_ops - student_ops
+        student_graph["missing_transformations"] = [
+            f"No '{op}' transformation (expert uses this)" for op in sorted(missing_transforms)
+        ]
+
+    # Check for unnecessary steps
+    if expert_graph:
+        expert_node_count = len(expert_graph.get("nodes", []))
+        student_node_count = len(student_nodes)
+        if student_node_count > expert_node_count + 2:
+            student_graph["unnecessary_steps"].append(
+                f"Student uses {student_node_count} steps; expert solves in {expert_node_count}"
+            )
+
+    # Abstraction mismatches
+    if expert_graph:
+        expert_abs_data = next(
+            (ad for ad in state.get("abstraction_data", []) if ad["level"] == "expert"),
+            None
+        )
+        student_avg = student_graph["abstraction_metrics"].get("average_abstraction", 1.0)
+        expert_avg = expert_abs_data["metrics"]["average_abstraction"] if expert_abs_data else 3.0
+        if student_avg < expert_avg - 0.5:
+            student_graph["abstraction_mismatches"].append(
+                f"Student avg abstraction={student_avg} vs expert avg={expert_avg}"
+            )
+
+    return {"student_graph": student_graph}
+
+
+# ---------------------------------------------------------------------------
+# Node 8: Gap Generator — derives gaps from structure
 # ---------------------------------------------------------------------------
 
 def gap_generator_node(state: ThinkingState) -> dict:
-    """Generate strict insight outputs about thinking gaps.
+    """Generate thinking gap insights derived from STRUCTURAL data, not text.
 
-    Reads: comparison_results, student_comparison, structured_graphs,
-           strategy_tags, _llm_client
+    Gap examples:
+    - "Your reasoning contains 0 transformation steps; expert uses 2"
+    - "Your abstraction level remains LOW throughout; expert shifts to HIGH at step 2"
+    - "You use 5 steps; expert reduces problem to 2 steps"
+
+    Reads: comparison_results, student_graph, reasoning_graphs, strategy_distributions,
+           abstraction_data
     Writes: gap_analysis
     """
     comparison = state["comparison_results"]
-    student_comp = state.get("student_comparison", {})
-    graphs = state["structured_graphs"]
-    tags = state["strategy_tags"]
-    llm_client = state.get("_llm_client")
+    student = state.get("student_graph", {})
+    graphs = state["reasoning_graphs"]
+    abs_data = state.get("abstraction_data", [])
     student_answer = state.get("student_answer", "").strip()
 
     gaps = []
 
-    # Always generate comparative gaps between levels
-    key_diffs = comparison.get("key_differences", [])
-    for diff in key_diffs:
-        gaps.append({
-            "insight": diff,
-            "severity": "info",
-        })
+    # Always: structural differences between levels
+    graph_shape = comparison.get("graph_shape", {})
+    strategy_dist = comparison.get("strategy_distribution", {})
+    abs_flow = comparison.get("abstraction_flow", {})
 
-    # If student answer exists, generate student-specific gaps
-    if student_answer and student_comp:
-        level_match = student_comp.get("student_level_match", "unknown")
+    for diff in comparison.get("key_differences", []):
+        gaps.append({"insight": diff, "severity": "info", "source": "structural"})
 
+    # Student-specific gaps
+    if student_answer and student.get("nodes"):
+        student_nodes = student.get("nodes", [])
+        student_node_count = len(student_nodes)
+        student_strategies = {n.get("strategy_type") for n in student_nodes}
+        student_ops = {n.get("operation_type") for n in student_nodes}
+        level_match = student.get("student_level_match", "unknown")
+
+        # Level match insight
         if level_match != "unknown":
             level_descriptions = {
                 "beginner": "direct application",
@@ -779,104 +1160,149 @@ def gap_generator_node(state: ThinkingState) -> dict:
             }
             level_desc = level_descriptions.get(level_match, level_match)
             gaps.append({
-                "insight": (
-                    f"Your approach follows {level_match}-level reasoning: "
-                    f"{level_desc}"
-                ),
+                "insight": f"Your approach follows {level_match}-level reasoning: {level_desc}",
                 "severity": "info" if level_match == "expert" else "warning",
+                "source": "comparison",
             })
 
-        # Missing steps
-        for step in student_comp.get("missing_steps", []):
+        # Step count comparison
+        expert_shape = graph_shape.get("expert", {})
+        expert_node_count = expert_shape.get("node_count", 0)
+        if expert_node_count > 0 and student_node_count > expert_node_count:
             gaps.append({
-                "insight": f"Missing step: {step}",
+                "insight": (
+                    f"You use {student_node_count} steps; "
+                    f"expert reduces problem to {expert_node_count} steps"
+                ),
                 "severity": "warning",
+                "source": "structural",
+            })
+
+        # Transformation gap
+        student_transform_count = sum(
+            1 for n in student_nodes
+            if n.get("strategy_type") in ("transformation", "reduction")
+        )
+        expert_transform_pct = strategy_dist.get("expert", {}).get("transformation_pct", 0)
+        expert_reduction_pct = strategy_dist.get("expert", {}).get("reduction_pct", 0)
+        expert_graph = next((g for g in graphs if g["level"] == "expert"), None)
+        expert_transform_count = 0
+        if expert_graph:
+            expert_transform_count = sum(
+                1 for n in expert_graph.get("nodes", [])
+                if n.get("strategy_type") in ("transformation", "reduction")
+            )
+        if student_transform_count < expert_transform_count:
+            gaps.append({
+                "insight": (
+                    f"Your reasoning contains {student_transform_count} transformation steps; "
+                    f"expert uses {expert_transform_count}"
+                ),
+                "severity": "warning",
+                "source": "strategy",
+            })
+
+        # Abstraction level gap
+        student_abs = student.get("abstraction_metrics", {})
+        student_avg_abs = student_abs.get("average_abstraction", 1.0)
+        student_max_abs = student_abs.get("max_abstraction", "LOW")
+        student_abs_flow = student_abs.get("abstraction_flow", [])
+
+        expert_abs = abs_flow.get("expert", {})
+        expert_avg_abs = expert_abs.get("average_abstraction", 1.0)
+        expert_max_abs = expert_abs.get("max_abstraction", "LOW")
+
+        if student_max_abs == "LOW" and expert_max_abs == "HIGH":
+            gaps.append({
+                "insight": (
+                    "Your abstraction level remains LOW throughout; "
+                    f"expert shifts to HIGH"
+                ),
+                "severity": "critical",
+                "source": "abstraction",
+            })
+        elif student_avg_abs < expert_avg_abs - 0.5:
+            gaps.append({
+                "insight": (
+                    f"Your average abstraction ({student_avg_abs}) is significantly lower "
+                    f"than expert ({expert_avg_abs})"
+                ),
+                "severity": "warning",
+                "source": "abstraction",
             })
 
         # Missing strategies
-        for strategy in student_comp.get("missing_strategies", []):
-            strategy_readable = strategy.replace("_", " ")
+        expert_strategies = set()
+        if expert_graph:
+            expert_strategies = {n.get("strategy_type") for n in expert_graph.get("nodes", [])}
+        missing = expert_strategies - student_strategies
+        for ms in sorted(missing):
             gaps.append({
-                "insight": f"Your reasoning lacks {strategy_readable} strategy",
+                "insight": f"You follow {', '.join(sorted(student_strategies))} only; missing {ms.replace('_', ' ')} strategy",
                 "severity": "warning",
+                "source": "strategy",
             })
 
-        # Inefficiencies
-        for ineff in student_comp.get("inefficiencies", []):
+        # Missing nodes
+        for mn in student.get("missing_nodes", []):
             gaps.append({
-                "insight": f"Inefficiency: {ineff}",
+                "insight": mn,
                 "severity": "warning",
+                "source": "structural",
             })
 
-        # Abstraction gaps
-        for gap in student_comp.get("abstraction_gaps", []):
+        # Abstraction mismatches
+        for am in student.get("abstraction_mismatches", []):
             gaps.append({
-                "insight": f"Abstraction gap: {gap}",
+                "insight": am,
                 "severity": "critical",
+                "source": "abstraction",
             })
 
-        # Generate LLM-enhanced gap insights
-        if llm_client:
-            prompt = (
-                "Based on this student comparison analysis, generate 3-5 specific "
-                "thinking gap insights.\n\n"
-                f"Student level match: {level_match}\n"
-                f"Missing steps: {student_comp.get('missing_steps', [])}\n"
-                f"Missing strategies: {student_comp.get('missing_strategies', [])}\n"
-                f"Inefficiencies: {student_comp.get('inefficiencies', [])}\n\n"
-                "Format each insight as a direct statement like:\n"
-                '- "Intermediate reasoning introduces step X, which is missing"\n'
-                '- "Expert simplifies using transformation Y"\n'
-                '- "Your reasoning lacks abstraction at step Z"\n'
-                '- "You are using a longer path than necessary"\n\n'
-                "Return a JSON array of objects with 'insight' and 'severity' "
-                '(one of: "info", "warning", "critical").\n'
-                "JSON array:"
-            )
-            result = _parse_json(_llm_call(llm_client, prompt, 512), None)
-            if isinstance(result, list):
-                for item in result[:5]:
-                    if isinstance(item, dict):
-                        severity = item.get("severity", "info")
-                        if severity not in {"info", "warning", "critical"}:
-                            severity = "info"
-                        gaps.append({
-                            "insight": item.get("insight", ""),
-                            "severity": severity,
-                        })
     else:
-        # No student answer — generate general gaps between levels
-        # Structural gaps
-        structural = comparison.get("structural", {})
-        beginner_steps = structural.get("beginner", {}).get("step_count", 0)
-        expert_steps = structural.get("expert", {}).get("step_count", 0)
-        if beginner_steps > 0 and expert_steps > 0:
+        # No student answer — generate level comparison gaps
+        beg_shape = graph_shape.get("beginner", {})
+        exp_shape = graph_shape.get("expert", {})
+        beg_nodes = beg_shape.get("node_count", 0)
+        exp_nodes = exp_shape.get("node_count", 0)
+
+        if beg_nodes > 0 and exp_nodes > 0:
             gaps.append({
                 "insight": (
-                    f"Beginner uses {beginner_steps} steps while expert uses "
-                    f"{expert_steps} steps — expert adds validation and generalization"
+                    f"Beginner uses {beg_nodes} steps; expert uses {exp_nodes} steps"
                 ),
                 "severity": "info",
+                "source": "structural",
             })
 
-        # Strategy gaps
-        strategy_data = comparison.get("strategy", {})
-        missing = strategy_data.get("missing_strategies", {})
-        for level, missing_tags in missing.items():
-            if missing_tags:
-                readable_tags = ", ".join(t.replace("_", " ") for t in missing_tags)
-                gaps.append({
-                    "insight": (
-                        f"{level.capitalize()} reasoning is missing: {readable_tags}"
-                    ),
-                    "severity": "info",
-                })
+        # Strategy comparison
+        beg_strat = strategy_dist.get("beginner", {})
+        exp_strat = strategy_dist.get("expert", {})
+        if beg_strat.get("transformation_pct", 0) == 0 and exp_strat.get("transformation_pct", 0) > 0:
+            gaps.append({
+                "insight": (
+                    f"Beginner has 0% transformation; expert has "
+                    f"{exp_strat['transformation_pct']}% transformation steps"
+                ),
+                "severity": "info",
+                "source": "strategy",
+            })
+
+        # Abstraction comparison
+        beg_abs = abs_flow.get("beginner", {})
+        exp_abs = abs_flow.get("expert", {})
+        if beg_abs.get("max_abstraction") == "LOW" and exp_abs.get("max_abstraction") == "HIGH":
+            gaps.append({
+                "insight": "Beginner stays at LOW abstraction; expert reaches HIGH",
+                "severity": "info",
+                "source": "abstraction",
+            })
 
     return {"gap_analysis": gaps}
 
 
 # ---------------------------------------------------------------------------
-# Graph Construction — builds the LangGraph StateGraph
+# Graph Construction — builds the LangGraph StateGraph (8 nodes)
 # ---------------------------------------------------------------------------
 
 def build_thinking_simulation_graph():
@@ -884,36 +1310,39 @@ def build_thinking_simulation_graph():
 
     Returns a compiled graph with execution flow:
         START → cognitive_profile_generator → parallel_reasoning_generator
-        → reasoning_structurer → strategy_tagger → comparative_analyzer
-        → (if student exists) student_comparator → gap_generator → END
+        → reasoning_graph_builder → strategy_constrained_generator
+        → abstraction_analyzer → structural_comparator
+        → (if student exists) student_graph_converter → gap_generator → END
 
-    All nodes are pure functions. No classes. No wrappers.
+    8 nodes, all pure functions, no classes, no wrappers.
     """
     graph = StateGraph(ThinkingState)
 
     # Register pure-function nodes
     graph.add_node("cognitive_profile_generator", cognitive_profile_generator_node)
     graph.add_node("parallel_reasoning_generator", parallel_reasoning_generator_node)
-    graph.add_node("reasoning_structurer", reasoning_structurer_node)
-    graph.add_node("strategy_tagger", strategy_tagger_node)
-    graph.add_node("comparative_analyzer", comparative_analyzer_node)
-    graph.add_node("student_comparator", student_comparator_node)
+    graph.add_node("reasoning_graph_builder", reasoning_graph_builder_node)
+    graph.add_node("strategy_constrained_generator", strategy_constrained_generator_node)
+    graph.add_node("abstraction_analyzer", abstraction_analyzer_node)
+    graph.add_node("structural_comparator", structural_comparator_node)
+    graph.add_node("student_graph_converter", student_graph_converter_node)
     graph.add_node("gap_generator", gap_generator_node)
 
     # Strict sequential edges (NON-NEGOTIABLE order)
     graph.add_edge(START, "cognitive_profile_generator")
     graph.add_edge("cognitive_profile_generator", "parallel_reasoning_generator")
-    graph.add_edge("parallel_reasoning_generator", "reasoning_structurer")
-    graph.add_edge("reasoning_structurer", "strategy_tagger")
-    graph.add_edge("strategy_tagger", "comparative_analyzer")
+    graph.add_edge("parallel_reasoning_generator", "reasoning_graph_builder")
+    graph.add_edge("reasoning_graph_builder", "strategy_constrained_generator")
+    graph.add_edge("strategy_constrained_generator", "abstraction_analyzer")
+    graph.add_edge("abstraction_analyzer", "structural_comparator")
 
-    # Conditional edge: student comparator only if student_answer exists
+    # Conditional edge: student graph converter only if student_answer exists
     graph.add_conditional_edges(
-        "comparative_analyzer",
+        "structural_comparator",
         _check_student_answer,
-        {"has_student": "student_comparator", "no_student": "gap_generator"},
+        {"has_student": "student_graph_converter", "no_student": "gap_generator"},
     )
-    graph.add_edge("student_comparator", "gap_generator")
+    graph.add_edge("student_graph_converter", "gap_generator")
     graph.add_edge("gap_generator", END)
 
     return graph.compile()
@@ -946,8 +1375,8 @@ class ThinkingSimulationEngine:
             student_answer: Optional student answer to compare against.
 
         Returns:
-            Dict with cognitive profiles, reasoning paths, strategy tags,
-            comparison results, student comparison, and gap analysis.
+            Dict with reasoning graphs, strategy distributions, structural
+            comparison, student graph, and gap analysis.
 
         Raises:
             ValueError: If problem is empty.
@@ -960,21 +1389,25 @@ class ThinkingSimulationEngine:
             "problem": problem.strip(),
             "student_answer": student_answer.strip() if student_answer else "",
             "cognitive_profiles": [],
-            "reasoning_paths": [],
-            "structured_graphs": [],
-            "strategy_tags": [],
+            "reasoning_graphs": [],
+            "strategy_distributions": [],
+            "abstraction_data": [],
             "comparison_results": {},
-            "student_comparison": {},
+            "student_graph": {},
             "gap_analysis": [],
+            "validation_passed": True,
+            "validation_notes": [],
         }
 
         final_state = self.graph.invoke(initial_state)
 
         return {
             "cognitive_profiles": final_state.get("cognitive_profiles", []),
-            "reasoning_paths": final_state.get("reasoning_paths", []),
-            "strategy_tags": final_state.get("strategy_tags", []),
+            "reasoning_paths": final_state.get("reasoning_graphs", []),
+            "strategy_tags": final_state.get("strategy_distributions", []),
             "comparison_results": final_state.get("comparison_results", {}),
-            "student_comparison": final_state.get("student_comparison", {}),
+            "student_comparison": final_state.get("student_graph", {}),
             "gap_analysis": final_state.get("gap_analysis", []),
+            "validation_passed": final_state.get("validation_passed", True),
+            "validation_notes": final_state.get("validation_notes", []),
         }
