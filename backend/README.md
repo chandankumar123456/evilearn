@@ -533,13 +533,12 @@ sequenceDiagram
     FastAPI->>FastAPI: Validate request (CognitiveLoadRequest)
     FastAPI->>CLO: optimizer.optimize(explanation, user_id)
     CLO->>CLO: graph.invoke(initial_state)
-    Note over CLO: Node 1: Analyze explanation into steps, concepts, abstraction
+    Note over CLO: Node 1: Analyze explanation (lightweight, NO LLM)
     Note over CLO: Node 2: Load/initialize user cognitive state
     Note over CLO: Node 3: Compute cognitive load (step density, concept gap, memory)
-    Note over CLO: Node 4: Compare load vs capacity → overload/optimal/underload
-    Note over CLO: Node 5: Adjust granularity (split/merge/checkpoint)
-    Note over CLO: Node 6: Validate and clean restructured steps
-    Note over CLO: Node 7: Update user state, decide loop/end
+    Note over CLO: Node 4: Compare load vs capacity, emit control signals
+    Note over CLO: Node 5: Adjust granularity + active abstraction control
+    Note over CLO: Node 6: Update user state, decide loop/end
     alt Load not optimal & iterations remaining
         Note over CLO: Loop back to Node 3 (re-estimate load)
     end

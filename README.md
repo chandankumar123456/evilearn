@@ -308,22 +308,21 @@ Every explanation has a cognitive cost. Too many steps at once → overload. Too
 ### System Architecture (LangGraph Nodes + Flow)
 
 ```
-START → Explanation Analyzer → User State Tracker → Load Estimator
-→ Control Engine → Granularity Controller → Explanation Restructurer
-→ Feedback Loop Manager → (loop back to Load Estimator OR END)
+START -> Explanation Analyzer -> User State Tracker -> Load Estimator
+-> Control Engine -> Granularity Controller
+-> Feedback Manager -> (loop back to Load Estimator OR END)
 ```
 
-All 7 nodes operate as pure functions on a shared `CognitiveLoadState` via LangGraph `StateGraph`. The graph is **cyclic** — the Feedback Loop Manager conditionally routes back to the Load Estimator for re-optimization (up to 3 iterations).
+All 6 nodes operate as pure functions on a shared `CognitiveLoadState` via LangGraph `StateGraph`. The graph is **cyclic** -- the Feedback Manager conditionally routes back to the Load Estimator for re-optimization (up to 3 iterations). The system is fully deterministic -- **no LLM is used**.
 
 | Node | Name | Responsibility |
 |------|------|---------------|
-| 1 | Explanation Analyzer | Breaks explanation into steps, extracts concepts, identifies abstraction levels |
+| 1 | Explanation Analyzer | Lightweight sentence splitting with heuristic abstraction detection and concept extraction (NO LLM) |
 | 2 | User State Tracker | Loads/initializes the dynamic user cognitive profile |
 | 3 | Load Estimator | Computes cognitive load metrics (step density, concept gap, memory demand) |
-| 4 | Control Engine | Compares load vs capacity, decides adaptation strategy (overload/optimal/underload) |
-| 5 | Granularity Controller | Adjusts step size — splits, merges, or adds checkpoints based on control decisions |
-| 6 | Explanation Restructurer | Validates and cleans restructured steps, ensures dependency consistency |
-| 7 | Feedback Loop Manager | Updates user state, determines whether to loop for further optimization |
+| 4 | Control Engine | Compares load vs capacity, decides adaptation strategy with step-specific signals |
+| 5 | Granularity Controller | Adjusts step size and actively controls abstraction levels, cleans dependencies |
+| 6 | Feedback Manager | Updates user state, determines whether to loop for further optimization |
 
 ### Cognitive Load Definition
 
@@ -634,13 +633,12 @@ sequenceDiagram
     FE->>API: POST /optimize-cognitive-load {explanation, user_id}
     API->>CLO: cognitive_load_optimizer.optimize(explanation, user_id)
 
-    Note over CLO: Node 1: Analyze explanation into steps, concepts, abstraction
+    Note over CLO: Node 1: Analyze explanation (lightweight, NO LLM)
     Note over CLO: Node 2: Load/initialize user cognitive state
     Note over CLO: Node 3: Compute cognitive load (step density, concept gap, memory)
-    Note over CLO: Node 4: Compare load vs capacity → overload/optimal/underload
-    Note over CLO: Node 5: Adjust granularity (split/merge/checkpoint)
-    Note over CLO: Node 6: Restructure and validate adapted steps
-    Note over CLO: Node 7: Update user state, decide loop/end
+    Note over CLO: Node 4: Compare load vs capacity, emit control signals
+    Note over CLO: Node 5: Adjust granularity + active abstraction control
+    Note over CLO: Node 6: Update user state, decide loop/end
 
     alt Load not optimal & iterations remaining
         Note over CLO: Loop back to Node 3 (re-estimate load)
@@ -915,7 +913,7 @@ The frontend starts on `http://localhost:5173` and proxies `/api` requests to th
 8. **All data is strictly typed.** Pydantic models validate every claim before storage. No untyped dicts in core flow.
 9. **Output is validated before persistence.** Pipeline output is validated via Pydantic schemas BEFORE inserting into the database.
 10. **Thinking Simulation is graph-based.** The Thinking Simulation Engine uses LangGraph StateGraph with 7 nodes, conditional edges, and shared state — no sequential function chaining.
-11. **Cognitive Load Optimizer is cyclic.** The Cognitive Load Optimizer uses LangGraph StateGraph with 7 nodes and a cyclic feedback loop that re-optimizes until load matches user capacity. It never changes explanation content — only structure and pacing.
+11. **Cognitive Load Optimizer is cyclic and deterministic.** The Cognitive Load Optimizer uses LangGraph StateGraph with 6 nodes, a cyclic feedback loop, and **no LLM dependency**. It actively controls abstraction levels and re-optimizes until load matches user capacity. It never changes explanation content -- only structure and pacing.
 
 ## Limitations
 
